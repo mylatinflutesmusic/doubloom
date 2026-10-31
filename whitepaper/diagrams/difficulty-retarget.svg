@@ -1,0 +1,50 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 300" width="720" height="300" role="img" aria-labelledby="fig3-title fig3-desc">
+  <title id="fig3-title">Difficulty retargeting every 2,016 blocks</title>
+  <desc id="fig3-desc">A step chart of difficulty over block height. Difficulty starts at the proof-of-work limit. Every 2,016 blocks the target is scaled by the observed timespan divided by the 14-day expected timespan, clamped to a factor of four and capped at the proof-of-work limit. Fast blocks raise difficulty; slow blocks lower it, but never below the limit.</desc>
+  <style>
+    text { font-family: "Times New Roman", Times, serif; fill: #14110c; }
+    .axis { stroke: #14110c; stroke-width: 1.2; fill: none; }
+    .tick { font-size: 12px; fill: #4b463d; }
+    .title { font-size: 12px; fill: #6b6459; letter-spacing: 0.03em; }
+    .step { stroke: #14110c; stroke-width: 1.8; fill: none; }
+    .limit { stroke: #6b6459; stroke-width: 1; fill: none; stroke-dasharray: 5 4; }
+    .guide { stroke: #b3aa98; stroke-width: 1; fill: none; stroke-dasharray: 3 4; }
+    .note { font-size: 12.5px; fill: #3f3a31; }
+    .small { font-size: 11px; fill: #6b6459; }
+  </style>
+
+  <text class="title" x="90" y="44">DIFFICULTY (HIGHER = HARDER)</text>
+
+  <!-- axes -->
+  <path class="axis" d="M90 58 V240 H660"/>
+  <path class="axis" d="M86 64 L90 56 L94 64"/>
+  <path class="axis" d="M652 236 L660 240 L652 244"/>
+
+  <!-- retarget guides -->
+  <path class="guide" d="M280 70 V240"/>
+  <path class="guide" d="M470 70 V240"/>
+  <text class="small" x="280" y="66" text-anchor="middle">retarget</text>
+  <text class="small" x="470" y="66" text-anchor="middle">retarget</text>
+
+  <!-- proof-of-work limit -->
+  <path class="limit" d="M90 210 H660"/>
+  <text class="small" x="654" y="202" text-anchor="end">pow limit (difficulty 1)</text>
+
+  <!-- difficulty step line -->
+  <path class="step" d="M90 210 H280 V150 H470 V180 H660"/>
+
+  <!-- annotations -->
+  <text class="note" x="185" y="200" text-anchor="middle">fast blocks → difficulty rises</text>
+  <text class="note" x="375" y="140" text-anchor="middle">slow blocks → difficulty falls</text>
+  <text class="note" x="565" y="170" text-anchor="middle">fast blocks → difficulty rises</text>
+  <text class="small" x="288" y="192">≤ 4× per retarget</text>
+
+  <!-- axes labels -->
+  <text class="tick" x="90" y="258" text-anchor="middle">0</text>
+  <text class="tick" x="280" y="258" text-anchor="middle">2,016</text>
+  <text class="tick" x="470" y="258" text-anchor="middle">4,032</text>
+  <text class="tick" x="654" y="258" text-anchor="end">6,048</text>
+  <text class="tick" x="660" y="278" text-anchor="end">block height</text>
+
+  <text class="small" x="375" y="296" text-anchor="middle">A = observed timespan of the window · E = 2,016 × 600 s = 14 days</text>
+</svg>

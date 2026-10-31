@@ -1,0 +1,35 @@
+name: Tests
+
+# Every push runs the suite, on any branch, against every Node.js version the
+# package claims to support: `engines.node` is >=18, so 18 is the oldest and 20
+# the current LTS. The project has no dependencies, so there is no install step;
+# add `npm ci` (and commit the lockfile it needs) if that ever changes.
+on:
+  push:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      # A failure on one version must not cancel the other: knowing whether the
+      # oldest supported Node is the only one broken is the whole point.
+      fail-fast: false
+      matrix:
+        # Quoted so each leg tracks the latest patch of that line rather than a
+        # single release: 18.x is the oldest supported, 20.x the current LTS.
+        node-version: ['18.x', '20.x']
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+
+      - name: Run the test suite (Node.js ${{ matrix.node-version }})
+        run: npm test

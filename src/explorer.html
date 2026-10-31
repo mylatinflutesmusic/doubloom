@@ -1,0 +1,1674 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Doubloom · DBL block explorer</title>
+    <style>
+      :root {
+        --bg: #0c0a06;
+        --panel: #14100a;
+        --panel-2: #1a140c;
+        --line: #2c2213;
+        --gold: #f0b73a;
+        --gold-soft: #f7d78a;
+        --cream: #f6ecd8;
+        --muted: #9c8f76;
+        --green: #7fd18a;
+        --mono: ui-monospace, "SFMono-Regular", "Cascadia Mono", Consolas, monospace;
+      }
+
+      * { box-sizing: border-box; }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+        color: var(--cream);
+        background:
+          radial-gradient(1100px 560px at 50% -8%, rgba(240, 183, 58, 0.14), transparent 65%),
+          radial-gradient(900px 700px at 85% 10%, rgba(240, 183, 58, 0.05), transparent 60%),
+          var(--bg);
+        font-family: ui-sans-serif, -apple-system, "Segoe UI", Inter, system-ui, sans-serif;
+        -webkit-font-smoothing: antialiased;
+      }
+
+      a { color: var(--gold-soft); text-decoration: none; }
+      a:hover { text-decoration: underline; }
+
+      .wrap { width: min(1120px, calc(100% - 40px)); margin: 0 auto; }
+
+      header.top {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 20px;
+        padding: 26px 0 18px;
+        border-bottom: 1px solid var(--line);
+      }
+
+      .brand { display: flex; align-items: center; gap: 14px; }
+
+      .brand img { width: 58px; height: 58px; filter: drop-shadow(0 6px 12px rgba(0,0,0,.5)); }
+
+      .brand h1 {
+        margin: 0;
+        font-size: 22px;
+        letter-spacing: 0.14em;
+        font-weight: 650;
+        text-transform: uppercase;
+      }
+
+      .brand .sub {
+        margin-top: 3px;
+        font-size: 12px;
+        color: var(--muted);
+        letter-spacing: 0.08em;
+      }
+
+      .brand .sub b { color: var(--gold); font-weight: 600; }
+
+      .status {
+        display: flex;
+        align-items: center;
+        gap: 9px;
+        padding: 8px 14px;
+        border: 1px solid var(--line);
+        border-radius: 999px;
+        background: var(--panel);
+        font-size: 12px;
+        color: var(--muted);
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+      }
+
+      .dot {
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background: var(--green);
+        box-shadow: 0 0 0 0 rgba(127, 209, 138, 0.55);
+        animation: pulse 2.4s infinite;
+      }
+
+      .dot.offline { background: #d16868; animation: none; }
+
+      .top-meta { display: flex; align-items: center; gap: 14px; min-width: 0; }
+
+      .announce {
+        display: flex;
+        align-items: baseline;
+        gap: 8px;
+        min-width: 0;
+        max-width: 340px;
+        font-size: 11.5px;
+        color: var(--muted);
+      }
+
+      .announce .label {
+        font-size: 9.5px;
+        letter-spacing: 0.18em;
+        text-transform: uppercase;
+      }
+
+      .announce .url {
+        font-family: var(--mono);
+        color: var(--gold-soft);
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        max-width: 240px;
+      }
+
+      /* The last peer check of that address: green when it answered, red when
+         it did not. Hidden until a check has run. */
+      .announce .reach {
+        padding: 2px 7px;
+        border: 1px solid var(--line);
+        border-radius: 999px;
+        font-size: 9.5px;
+        letter-spacing: 0.14em;
+        text-transform: uppercase;
+        white-space: nowrap;
+      }
+
+      .announce .reach.good { color: var(--green); border-color: rgba(127, 209, 138, 0.4); }
+      .announce .reach.bad { color: #e8a0a0; border-color: rgba(232, 160, 160, 0.45); }
+
+      .mine-toggle {
+        padding: 7px 12px;
+        border: 1px solid rgba(240, 183, 58, 0.4);
+        border-radius: 999px;
+        background: rgba(240, 183, 58, 0.08);
+        color: var(--gold-soft);
+        font: inherit;
+        font-size: 10.5px;
+        letter-spacing: 0.1em;
+        text-transform: uppercase;
+        white-space: nowrap;
+        cursor: pointer;
+      }
+
+      .mine-toggle:hover:not(:disabled) { background: rgba(240, 183, 58, 0.16); }
+      .mine-toggle:focus-visible { outline: 2px solid var(--gold); outline-offset: 2px; }
+      .mine-toggle:disabled { opacity: 0.45; cursor: not-allowed; }
+
+      .mine-note {
+        max-width: 260px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        font-size: 11px;
+        color: var(--muted);
+      }
+
+      .mine-note.bad { color: #e8a0a0; }
+
+      @keyframes pulse {
+        0% { box-shadow: 0 0 0 0 rgba(127, 209, 138, 0.45); }
+        70% { box-shadow: 0 0 0 9px rgba(127, 209, 138, 0); }
+        100% { box-shadow: 0 0 0 0 rgba(127, 209, 138, 0); }
+      }
+
+      .hero {
+        display: grid;
+        grid-template-columns: 1.25fr 0.75fr;
+        align-items: center;
+        gap: 30px;
+        padding: 56px 0 44px;
+      }
+
+      .eyebrow {
+        margin: 0 0 14px;
+        color: var(--gold);
+        font-size: 11px;
+        letter-spacing: 0.3em;
+        text-transform: uppercase;
+      }
+
+      .hero h2 {
+        margin: 0;
+        font-size: clamp(38px, 5.6vw, 66px);
+        line-height: 0.98;
+        letter-spacing: -0.02em;
+        font-weight: 600;
+      }
+
+      .hero h2 em {
+        font-style: normal;
+        color: var(--gold);
+        text-shadow: 0 0 34px rgba(240, 183, 58, 0.28);
+      }
+
+      .hero p.lede {
+        margin: 22px 0 0;
+        max-width: 520px;
+        color: var(--muted);
+        font-size: 15px;
+        line-height: 1.7;
+      }
+
+      .hero-coin { display: flex; justify-content: center; }
+
+      .hero-coin img {
+        width: min(330px, 100%);
+        filter: drop-shadow(0 26px 44px rgba(0, 0, 0, 0.55));
+        animation: float 7s ease-in-out infinite;
+      }
+
+      @keyframes float {
+        0%, 100% { transform: translateY(-6px) rotate(-1.5deg); }
+        50% { transform: translateY(8px) rotate(1.5deg); }
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        .hero-coin img, .dot { animation: none; }
+      }
+
+      .stats {
+        display: grid;
+        grid-template-columns: repeat(5, 1fr);
+        gap: 14px;
+        margin-bottom: 30px;
+      }
+
+      .stat {
+        padding: 18px 18px 16px;
+        border: 1px solid var(--line);
+        border-radius: 14px;
+        background: linear-gradient(170deg, var(--panel-2), var(--panel));
+      }
+
+      .stat .label {
+        font-size: 10.5px;
+        letter-spacing: 0.18em;
+        text-transform: uppercase;
+        color: var(--muted);
+      }
+
+      .stat .value {
+        margin-top: 9px;
+        font-size: 24px;
+        font-weight: 600;
+        font-variant-numeric: tabular-nums;
+      }
+
+      .stat .value small { font-size: 12px; color: var(--muted); font-weight: 400; }
+
+      .stat .note { margin-top: 5px; font-size: 11.5px; color: var(--muted); }
+
+      .bar {
+        height: 4px;
+        margin-top: 12px;
+        border-radius: 99px;
+        background: #241b0e;
+        overflow: hidden;
+      }
+
+      .bar > i {
+        display: block;
+        height: 100%;
+        width: 0%;
+        background: linear-gradient(90deg, #b97c13, var(--gold));
+        transition: width 0.6s ease;
+      }
+
+      .panel {
+        border: 1px solid var(--line);
+        border-radius: 16px;
+        background: linear-gradient(180deg, var(--panel-2), var(--panel));
+        padding: 20px 20px 8px;
+        margin-bottom: 18px;
+        overflow: hidden;
+      }
+
+      .panel-head {
+        display: flex;
+        align-items: baseline;
+        justify-content: space-between;
+        gap: 12px;
+        margin-bottom: 12px;
+      }
+
+      .panel h3 {
+        margin: 0;
+        font-size: 13px;
+        letter-spacing: 0.18em;
+        text-transform: uppercase;
+        color: var(--gold-soft);
+        font-weight: 600;
+      }
+
+      .panel-head span { font-size: 11px; color: var(--muted); }
+
+      table { width: 100%; border-collapse: collapse; font-size: 13px; }
+
+      th {
+        text-align: left;
+        font-size: 10.5px;
+        letter-spacing: 0.14em;
+        text-transform: uppercase;
+        color: var(--muted);
+        font-weight: 500;
+        padding: 10px 8px;
+        border-bottom: 1px solid var(--line);
+      }
+
+      td {
+        padding: 12px 8px;
+        border-bottom: 1px solid rgba(44, 34, 19, 0.65);
+        font-variant-numeric: tabular-nums;
+      }
+
+      tr:last-child td { border-bottom: none; }
+
+      tbody tr:hover { background: rgba(240, 183, 58, 0.04); }
+
+      .mono { font-family: var(--mono); font-size: 12.5px; }
+
+      .height { color: var(--gold); font-weight: 600; }
+
+      .hash { color: var(--cream); }
+
+      .hash:hover { color: var(--gold-soft); text-decoration: none; }
+
+      .muted { color: var(--muted); }
+
+      .badge {
+        display: inline-block;
+        padding: 3px 8px;
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        font-size: 11px;
+        color: var(--muted);
+        margin-right: 6px;
+      }
+
+      .grid2 {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 18px;
+      }
+
+      .facts { margin: 0; padding: 0; }
+
+      .facts div {
+        display: flex;
+        justify-content: space-between;
+        gap: 18px;
+        padding: 11px 0;
+        border-bottom: 1px solid rgba(44, 34, 19, 0.65);
+        font-size: 13px;
+      }
+
+      .facts div:last-child { border-bottom: none; }
+      .facts dt { color: var(--muted); margin: 0; }
+      .facts dd { margin: 0; text-align: right; min-width: 0; }
+      /* The pid is short and the address is not, so they share one row: the
+         address shrinks and ellipsizes instead of pushing the row wider. */
+      .node-identity {
+        display: flex;
+        justify-content: flex-end;
+        align-items: baseline;
+        gap: 5px;
+        min-width: 0;
+      }
+      /* Only the address may shrink: the pid is short and the uptime has to
+         stay readable, so both keep their width when the panel is narrow. */
+      .node-identity #backup-node-pid,
+      .node-identity .node-uptime {
+        flex: 0 0 auto;
+        white-space: nowrap;
+      }
+      .node-identity .node-address {
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      /* Uptime ticks every second: tabular digits keep the whole row from
+         shifting sideways as the counter changes. */
+      .node-identity .node-uptime {
+        color: var(--muted);
+        font-variant-numeric: tabular-nums;
+      }
+      .recovery-entry { display: block; }
+      .recovery-entry + .recovery-entry { margin-top: 4px; }
+
+      .health {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        color: var(--muted);
+        font-size: 11px;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+      }
+
+      .health-dot {
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background: #6b6152;
+        flex: none;
+      }
+
+      .health.ok { color: var(--green); }
+      .health.ok .health-dot {
+        background: var(--green);
+        box-shadow: 0 0 10px rgba(127, 209, 138, 0.45);
+      }
+
+      .health.warn { color: var(--gold); }
+      .health.warn .health-dot {
+        background: var(--gold);
+        box-shadow: 0 0 10px rgba(240, 183, 58, 0.35);
+      }
+
+      .health.bad { color: #e08080; }
+      .health.bad .health-dot {
+        background: #d16868;
+        box-shadow: 0 0 10px rgba(209, 104, 104, 0.4);
+      }
+
+      /* Shown only while a chain switch is recent, so a reorg is visible
+         without reading the log or comparing work by hand. */
+      .reorg-note {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: baseline;
+        gap: 8px;
+        margin: 0 0 18px;
+        padding: 10px 14px;
+        border: 1px solid rgba(209, 104, 104, 0.35);
+        border-radius: 10px;
+        background: rgba(209, 104, 104, 0.08);
+        color: var(--cream);
+        font-size: 12px;
+      }
+
+      .reorg-note[hidden] { display: none; }
+
+      .reorg-note strong {
+        color: #e8a0a0;
+        font-size: 11px;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+      }
+
+      .reorg-note .mono { color: var(--gold-soft); }
+
+      /* A ring around the countdown: how far through the interval the wait is,
+         so a glance distinguishes a run that is nearly due from one just done. */
+      .next-backup {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      }
+
+      .countdown-ring {
+        flex: none;
+        transform: rotate(-90deg);
+      }
+
+      .countdown-ring[hidden] { display: none; }
+
+      .countdown-ring .ring-track {
+        fill: none;
+        stroke: var(--line);
+        stroke-width: 2.5;
+      }
+
+      .countdown-ring .ring-fill {
+        fill: none;
+        stroke: var(--gold);
+        stroke-width: 2.5;
+        stroke-linecap: round;
+        transition: stroke-dashoffset 0.4s linear;
+      }
+
+      .backup-path {
+        max-width: 620px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .backup-error {
+        margin: 2px 0 14px;
+        padding: 10px 12px;
+        border: 1px solid rgba(209, 104, 104, 0.35);
+        border-radius: 10px;
+        background: rgba(209, 104, 104, 0.07);
+        color: #e8a0a0;
+        font-size: 12px;
+      }
+
+      .backup-note { margin: 2px 0 14px; color: var(--muted); font-size: 12px; }
+
+      .backup-actions {
+        display: flex;
+        align-items: center;
+        flex-wrap: wrap;
+        gap: 12px;
+        margin: 2px 0 14px;
+      }
+
+      .backup-actions button {
+        padding: 8px 14px;
+        border: 1px solid rgba(240, 183, 58, 0.4);
+        border-radius: 9px;
+        background: rgba(240, 183, 58, 0.08);
+        color: var(--gold-soft);
+        font: inherit;
+        font-size: 12px;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        cursor: pointer;
+      }
+
+      .backup-actions button:hover:not(:disabled) {
+        background: rgba(240, 183, 58, 0.16);
+      }
+
+      .backup-actions button:focus-visible {
+        outline: 2px solid var(--gold);
+        outline-offset: 2px;
+      }
+
+      .backup-actions button:disabled {
+        opacity: 0.45;
+        cursor: not-allowed;
+      }
+
+      /* Every archive retention has kept, so any of them can be fetched rather
+         than only the one the schedule calls newest. */
+      .backup-archives {
+        margin-top: 14px;
+        font-size: 11.5px;
+        color: var(--muted);
+      }
+
+      .backup-archives[hidden] { display: none; }
+
+      .backup-archives .archives-label {
+        display: block;
+        font-size: 9.5px;
+        letter-spacing: 0.18em;
+        text-transform: uppercase;
+        margin-bottom: 7px;
+      }
+
+      .backup-archives ul {
+        list-style: none;
+        margin: 0;
+        padding: 0;
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px 16px;
+      }
+
+      .backup-archives li {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: baseline;
+        gap: 2px 6px;
+        width: 100%;
+      }
+
+      .backup-archives a {
+        font-family: var(--mono);
+        color: var(--gold-soft);
+        text-decoration: none;
+      }
+
+      .backup-archives a:hover { text-decoration: underline; }
+      .backup-archives a:focus-visible { outline: 2px solid var(--gold); outline-offset: 2px; }
+
+      /* The digest an operator compares their saved file against: selectable in
+         one go, and broken anywhere so it never widens the panel. */
+      .backup-archives .archive-sum {
+        font-family: var(--mono);
+        font-size: 10.5px;
+        color: var(--muted);
+        user-select: all;
+        word-break: break-all;
+      }
+
+      .backup-archives .archive-sum.pending { font-style: italic; }
+
+      .backup-archives .archive-newest {
+        font-size: 9px;
+        letter-spacing: 0.14em;
+        text-transform: uppercase;
+        color: var(--green);
+      }
+
+      .backup-action-status { font-size: 12px; color: var(--muted); }
+      .backup-action-status.bad { color: #e8a0a0; }
+
+      .empty {
+        padding: 26px 8px 22px;
+        color: var(--muted);
+        font-size: 13px;
+      }
+
+      footer {
+        display: flex;
+        flex-wrap: wrap;
+        justify-content: space-between;
+        gap: 10px;
+        padding: 28px 0 46px;
+        color: var(--muted);
+        font-size: 11.5px;
+        letter-spacing: 0.06em;
+      }
+
+      @media (max-width: 860px) {
+        .hero { grid-template-columns: 1fr; padding: 38px 0 30px; text-align: left; }
+        .hero-coin { order: -1; }
+        .hero-coin img { width: 210px; }
+        .stats { grid-template-columns: repeat(2, 1fr); }
+        .grid2 { grid-template-columns: 1fr; }
+        .announce .url { max-width: 150px; }
+      }
+
+      @media (max-width: 560px) {
+        .stats { grid-template-columns: 1fr; }
+        .brand img { width: 46px; height: 46px; }
+        .brand h1 { font-size: 18px; }
+        .status { display: none; }
+        .announce { display: none; }
+        .mine-note { display: none; }
+        .blocks th:nth-child(3), .blocks td:nth-child(3) { display: none; }
+        .peer-url { max-width: 210px; overflow: hidden; text-overflow: ellipsis; }
+        #peer-traffic { display: none; }
+        .backup-path { max-width: 220px; }
+        .node-identity .node-address { max-width: 220px; }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <header class="top">
+        <div class="brand">
+          <img src="/assets/doubloom.svg" alt="Doubloom coin" />
+          <div>
+            <h1>Doubloom</h1>
+            <div class="sub"><b>Đ</b> · DBL · <span id="network">network</span></div>
+          </div>
+        </div>
+        <div class="top-meta">
+          <div class="announce" id="announce-block" hidden title="address peers are told to use">
+            <span class="label">announced</span>
+            <span class="url" id="announce">—</span>
+            <span class="reach" id="reachability" hidden></span>
+          </div>
+          <div class="status"><span class="dot" id="dot"></span><span id="status">connecting</span></div>
+          <button type="button" class="mine-toggle" id="mine-toggle" disabled title="Start or stop this node's miner">Mining…</button>
+          <span class="mine-note" id="mine-note" role="status" aria-live="polite"></span>
+        </div>
+      </header>
+
+      <div class="reorg-note" id="reorg-note" role="status" aria-live="polite" hidden>
+        <strong>Chain switch</strong>
+        <span id="reorg-text"></span>
+      </div>
+
+      <section class="hero">
+        <div>
+          <p class="eyebrow">SHA-256 proof-of-work</p>
+          <h2>Sound money,<br /><em>double bloom.</em></h2>
+          <p class="lede">
+            Twenty-one million DBL, ten-minute blocks, and a halving every
+            210,000 blocks — the monetary policy that made Bitcoin, struck on a
+            new coin. No pre-mine, no owner, no administrator.
+          </p>
+        </div>
+        <div class="hero-coin">
+          <img src="/assets/doubloom.svg" alt="The Doubloom coin: a golden coin with a double-barred D" />
+        </div>
+      </section>
+
+      <section class="stats" aria-label="Chain statistics">
+        <div class="stat">
+          <div class="label">Block height</div>
+          <div class="value" id="height">—</div>
+          <div class="note" id="tip-age">waiting for node</div>
+        </div>
+        <div class="stat">
+          <div class="label">Circulating supply</div>
+          <div class="value"><span id="supply">—</span> <small>DBL</small></div>
+          <div class="bar"><i id="supply-bar"></i></div>
+        </div>
+        <div class="stat">
+          <div class="label">Difficulty</div>
+          <div class="value" id="difficulty">—</div>
+          <div class="note" id="next-subsidy">—</div>
+        </div>
+        <div class="stat">
+          <div class="label">Chain work</div>
+          <div class="value" id="chain-work">—</div>
+          <div class="note" id="chain-work-note">since genesis</div>
+        </div>
+        <div class="stat">
+          <div class="label">Mempool</div>
+          <div class="value"><span id="mempool-count">—</span> <small>tx</small></div>
+          <div class="note" id="peer-count">—</div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <h3>Latest blocks</h3>
+          <span id="network-note">auto-refreshing every 5s</span>
+        </div>
+        <table class="blocks">
+          <thead>
+            <tr>
+              <th>Height</th>
+              <th>Hash</th>
+              <th>Age</th>
+              <th>Transactions</th>
+              <th>Size</th>
+            </tr>
+          </thead>
+          <tbody id="blocks">
+            <tr><td colspan="5" class="empty">Connecting to the node…</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section class="panel" aria-label="Peer traffic">
+        <div class="panel-head">
+          <h3>Peers</h3>
+          <span id="peer-traffic">no traffic yet</span>
+        </div>
+        <table>
+          <thead>
+            <tr>
+              <th>Peer</th>
+              <th>Received</th>
+              <th>Sent</th>
+              <th>Last exchange</th>
+            </tr>
+          </thead>
+          <tbody id="peers">
+            <tr><td colspan="4" class="empty">No peer traffic since this node started.</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section class="panel" aria-label="Automatic backups">
+        <div class="panel-head">
+          <h3>Automatic backups</h3>
+          <span class="health" id="backup-state" aria-live="polite">
+            <span class="health-dot" aria-hidden="true"></span>
+            <span id="backup-state-label">checking</span>
+          </span>
+        </div>
+        <dl class="facts">
+          <div><dt>Last backup</dt><dd id="backup-last">—</dd></div>
+          <div><dt>Archived height</dt><dd id="backup-height">—</dd></div>
+          <div><dt>Schedule</dt><dd id="backup-schedule">—</dd></div>
+          <div>
+            <dt>Node</dt>
+            <dd class="mono node-identity" id="backup-node">
+              <span id="backup-node-pid">—</span>
+              <span class="node-address" id="backup-node-announce"></span>
+              <span class="node-uptime" id="backup-node-uptime"></span>
+            </dd>
+          </div>
+          <div>
+            <dt>Next backup</dt>
+            <dd class="next-backup">
+              <svg class="countdown-ring" id="next-ring" viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" hidden>
+                <circle class="ring-track" cx="12" cy="12" r="9" />
+                <circle class="ring-fill" id="next-ring-fill" cx="12" cy="12" r="9" />
+              </svg>
+              <span id="backup-next">—</span>
+            </dd>
+          </div>
+          <div><dt>Last recovery</dt><dd id="backup-recovery">—</dd></div>
+          <div><dt>Earlier recoveries</dt><dd id="backup-recovery-history">—</dd></div>
+          <div><dt>Archive</dt><dd class="mono backup-path" id="backup-path">—</dd></div>
+        </dl>
+        <div class="backup-actions">
+          <button type="button" id="backup-now" disabled>Back up now</button>
+          <span class="backup-action-status" id="backup-action-status" role="status" aria-live="polite"></span>
+        </div>
+        <div class="backup-archives" id="backup-archives" hidden>
+          <span class="archives-label">Retained archives</span>
+          <ul id="backup-archive-list"></ul>
+        </div>
+        <div class="backup-error" id="backup-error" hidden></div>
+        <div class="backup-note" id="backup-note" hidden></div>
+      </section>
+
+      <section class="grid2">
+        <div class="panel">
+          <div class="panel-head"><h3>Mempool</h3><span id="mempool-note"></span></div>
+          <div id="mempool" class="empty">No pending transactions.</div>
+        </div>
+        <div class="panel">
+          <div class="panel-head"><h3>The coin</h3><span>consensus</span></div>
+          <dl class="facts">
+            <div><dt>Proof of work</dt><dd class="mono">SHA-256d</dd></div>
+            <div><dt>Block interval</dt><dd>10 minutes</dd></div>
+            <div><dt>Difficulty retarget</dt><dd>every 2,016 blocks</dd></div>
+            <div><dt>Block subsidy</dt><dd>50 DBL, halved every 210,000</dd></div>
+            <div><dt>Hard cap</dt><dd class="mono">21,000,000 DBL</dd></div>
+            <div><dt>Smallest unit</dt><dd>1 petal = 0.00000001 DBL</dd></div>
+          </dl>
+        </div>
+      </section>
+
+      <footer>
+        <span>Doubloom · Đ · peer-to-peer electronic cash</span>
+        <span><a href="/api/info">API</a> · <a href="/api/blocks">blocks</a> · <a href="/api/mempool">mempool</a> · <a href="/api/backup">backup</a></span>
+      </footer>
+    </div>
+
+    <script>
+      const $ = (id) => document.getElementById(id);
+
+      const escape = (value) =>
+        String(value).replace(/[&<>"']/g, (character) => ({
+          "&": "&amp;",
+          "<": "&lt;",
+          ">": "&gt;",
+          '"': "&quot;",
+          "'": "&#39;",
+        })[character]);
+
+      const formatNumber = (value, digits = 0) =>
+        Number(value).toLocaleString(undefined, {
+          minimumFractionDigits: digits,
+          maximumFractionDigits: digits,
+        });
+
+      // Cumulative work arrives as a BigInt decimal string: it outgrows a JS
+      // number once difficulty rises, and a full 78-digit value would overflow
+      // the card. Keep exact grouped digits while they fit, then shorten to an
+      // exponent with the exact figure in the tooltip.
+      const formatWork = (value) => {
+        const text = String(value ?? "");
+        if (!/^\d+$/.test(text)) return "—";
+        if (text.length <= 15) {
+          return text.replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+        }
+        const digits = text.slice(0, 4);
+        return `${digits[0]}.${digits.slice(1)}e+${text.length - 1}`;
+      };
+
+      // Transfer sizes keep one decimal below 100, so a sync that costs 1.3 MiB
+      // reads as that rather than rounding to a whole megabyte.
+      const formatBytes = (value) => {
+        const bytes = Number(value);
+        if (!Number.isFinite(bytes) || bytes <= 0) return "0 B";
+        const units = ["B", "KiB", "MiB", "GiB"];
+        let size = bytes;
+        let unit = 0;
+        while (size >= 1024 && unit < units.length - 1) {
+          size /= 1024;
+          unit += 1;
+        }
+        const text = unit === 0 || size >= 100 ? formatNumber(size, 0) : formatNumber(size, 1);
+        return `${text} ${units[unit]}`;
+      };
+
+      const age = (seconds) => {
+        const delta = Math.max(0, Math.floor(Date.now() / 1000) - seconds);
+        if (delta < 60) return `${delta}s ago`;
+        if (delta < 3600) return `${Math.floor(delta / 60)}m ago`;
+        if (delta < 86400) return `${Math.floor(delta / 3600)}h ago`;
+        return `${Math.floor(delta / 86400)}d ago`;
+      };
+
+      // Current length of the peer-sync wait, or null when nothing is waiting.
+      const syncWaitedNow = () =>
+        backupSyncWaitedMs === null
+          ? null
+          : backupSyncWaitedMs + Math.max(0, Date.now() - backupSyncWaitedAt);
+
+      const supplyCap = 21000000;
+      let backupEnabled = false;
+      let backupInFlight = false;
+      let nextBackupAt = null;
+      let backupWaitingForSync = false;
+      let backupFirstDelayMs = null;
+      // How long the node said the first backup had been waiting for peer sync,
+      // and when this page heard it. The wait is measured by the node, then
+      // advanced locally so the figure moves every second instead of stepping
+      // once per five-second refresh (and no clock agreement is needed).
+      let backupSyncWaitedMs = null;
+      let backupSyncWaitedAt = 0;
+      // How long the current wait is: the first delay before the first archive,
+      // the interval after that. The ring is a fraction of this.
+      let backupCycleMs = null;
+      let backupNextRunMissingSince = null;
+      // When the answering node started, from /api/info, so the uptime counter
+      // can advance every second without asking the node again.
+      let nodeStartedAt = null;
+      const NO_NEXT_RUN_GRACE_MS = 60000;
+
+      const utcTime = (iso) => {
+        const date = new Date(iso);
+        if (Number.isNaN(date.getTime())) return "unknown";
+        return `${date.toISOString().replace("T", " ").slice(0, 19)} UTC`;
+      };
+
+      // Two units are enough for an uptime: seconds are only interesting while
+      // the node is young, and a month-old process needs days, not seconds.
+      const formatUptime = (milliseconds) => {
+        const total = Math.max(0, Math.floor(milliseconds / 1000));
+        const days = Math.floor(total / 86400);
+        const hours = Math.floor((total % 86400) / 3600);
+        const minutes = Math.floor((total % 3600) / 60);
+        const seconds = total % 60;
+        // A zero second unit is dropped rather than printed, so an hour-old
+        // node reads "1h" instead of "1h 0m".
+        if (days > 0) return hours > 0 ? `${days}d ${hours}h` : `${days}d`;
+        if (hours > 0) return minutes > 0 ? `${hours}h ${minutes}m` : `${hours}h`;
+        // Seconds are zero-padded once minutes are shown, so the counter's
+        // width stays put as it ticks rather than growing at 10s.
+        if (minutes > 0) return `${minutes}m ${String(seconds).padStart(2, "0")}s`;
+        return `${seconds}s`;
+      };
+
+      function renderNodeUptime() {
+        const box = $("backup-node-uptime");
+        if (nodeStartedAt === null) {
+          box.textContent = "";
+          box.hidden = true;
+          return;
+        }
+        box.hidden = false;
+        box.textContent = `· up ${formatUptime(Date.now() - nodeStartedAt)}`;
+        box.title = `up since ${utcTime(nodeStartedAt)}`;
+      }
+
+      const ageIso = (iso) => {
+        const date = new Date(iso);
+        if (Number.isNaN(date.getTime())) return "unknown";
+        return age(Math.floor(date.getTime() / 1000));
+      };
+
+      const formatCountdown = (milliseconds) => {
+        if (!Number.isFinite(milliseconds)) return "—";
+        if (milliseconds <= 0) return "due now";
+        const seconds = Math.ceil(milliseconds / 1000);
+        if (seconds < 60) return `in ${seconds}s`;
+        const minutes = Math.floor(seconds / 60);
+        const rest = seconds % 60;
+        if (minutes < 60) return rest ? `in ${minutes}m ${rest}s` : `in ${minutes}m`;
+        const hours = Math.floor(minutes / 60);
+        const restMinutes = minutes % 60;
+        if (hours < 24) {
+          return restMinutes ? `in ${hours}h ${restMinutes}m` : `in ${hours}h`;
+        }
+        const days = Math.floor(hours / 24);
+        const restHours = hours % 24;
+        return restHours ? `in ${days}d ${restHours}h` : `in ${days}d`;
+      };
+
+      const RING_CIRCUMFERENCE = 2 * Math.PI * 9;
+
+      // An archive only helps if it still represents the chain. With ten-minute
+      // blocks, six blocks is a full interval of history the newest archive does
+      // not have — enough that "recently written" and "up to date" differ.
+      const BACKUP_LAG_BLOCKS = 6;
+
+      function renderNextRing(remaining) {
+        const ring = $("next-ring");
+        const fill = $("next-ring-fill");
+        if (
+          nextBackupAt === null ||
+          !Number.isFinite(backupCycleMs) ||
+          backupCycleMs <= 0 ||
+          backupWaitingForSync
+        ) {
+          // SVG elements have no `hidden` IDL property, so toggle the attribute
+          // the stylesheet actually keys off.
+          ring.toggleAttribute("hidden", true);
+          ring.removeAttribute("title");
+          fill.style.strokeDashoffset = `${RING_CIRCUMFERENCE}`;
+          return;
+        }
+        const elapsed = Math.min(1, Math.max(0, 1 - remaining / backupCycleMs));
+        fill.style.strokeDasharray = `${RING_CIRCUMFERENCE}`;
+        fill.style.strokeDashoffset = `${RING_CIRCUMFERENCE * (1 - elapsed)}`;
+        ring.toggleAttribute("hidden", false);
+        ring.setAttribute(
+          "title",
+          `${Math.round(elapsed * 100)}% of the ${duration(
+            backupCycleMs,
+          )} wait elapsed`,
+        );
+      }
+
+      function renderNextBackup() {
+        const target = $("backup-next");
+        if (nextBackupAt === null) {
+          target.textContent = "—";
+          target.removeAttribute("title");
+          renderNextRing(0);
+          return;
+        }
+        const firstDelay = Number.isFinite(backupFirstDelayMs)
+          ? ` · first delay ${duration(backupFirstDelayMs)}`
+          : "";
+        const remaining = nextBackupAt - Date.now();
+        const waited = backupWaitingForSync ? syncWaitedNow() : null;
+        target.title = new Date(nextBackupAt).toISOString();
+        target.textContent = `${
+          backupWaitingForSync
+            ? `waiting for sync${
+                Number.isFinite(waited) ? ` ${duration(waited)}` : ""
+              }`
+            : formatCountdown(remaining)
+        }${firstDelay}`;
+        renderNextRing(remaining);
+      }
+
+      // Archives are gzip JSON, so sizes land in the kilobyte range for small
+      // chains and megabytes only for long ones.
+      const fileSize = (bytes) => {
+        if (!Number.isFinite(bytes)) return "—";
+        if (bytes < 1024) return `${formatNumber(bytes)} B`;
+        if (bytes < 1024 * 1024) return `${formatNumber(bytes / 1024, 1)} KB`;
+        return `${formatNumber(bytes / (1024 * 1024), 1)} MB`;
+      };
+
+      const duration = (milliseconds) => {
+        if (!Number.isFinite(milliseconds)) return "—";
+        if (milliseconds < 60000) {
+          const seconds = milliseconds / 1000;
+          return `${formatNumber(seconds, seconds % 1 === 0 ? 0 : 1)}s`;
+        }
+        const minutes = milliseconds / 60000;
+        return `${formatNumber(minutes, minutes % 1 === 0 ? 0 : 1)} min`;
+      };
+
+      // One link per archive retention has kept. The node decides what is
+      // downloadable, so the href carries only the name it reported.
+      function renderArchives(backup) {
+        const list = $("backup-archive-list");
+        const archives = Array.isArray(backup?.archives) ? backup.archives : [];
+        if (archives.length === 0) {
+          $("backup-archives").hidden = true;
+          list.innerHTML = "";
+          return;
+        }
+
+        const newestPath =
+          typeof backup?.lastBackup?.path === "string"
+            ? backup.lastBackup.path.split(/[\\/]/).pop()
+            : null;
+        $("backup-archives").hidden = false;
+        list.innerHTML = archives
+          .map((archive, index) => {
+            const name = String(archive.name ?? "");
+            const at = Date.parse(archive.at);
+            const label = Number.isFinite(at)
+              ? utcTime(archive.at).replace(" UTC", "")
+              : name;
+            const size = Number.isFinite(Number(archive.bytes))
+              ? formatBytes(archive.bytes)
+              : "unknown size";
+            const exactSize = Number.isFinite(Number(archive.bytes))
+              ? `${formatNumber(archive.bytes)} bytes gzipped`
+              : "size unknown";
+            // The recorded archive wins; without one, the list is newest first.
+            const isNewest = newestPath ? name === newestPath : index === 0;
+            // A digest is read off disk by the node, so the first refresh after
+            // a backup shows it still being computed.
+            const sum = typeof archive.sha256 === "string" ? archive.sha256 : "";
+            const sumText = sum
+              ? `sha256 ${sum}`
+              : "sha256 computing…";
+            return `
+              <li>
+                <a href="/api/backup/archives/${encodeURIComponent(name)}" download="${escape(name)}" title="${escape(
+                  `${name} · ${exactSize} · ${label} UTC${sum ? ` · sha256 ${sum}` : ""}`,
+                )}">${label} · ${size}</a>${isNewest ? ' <span class="archive-newest">newest</span>' : ""}
+                <code class="archive-sum${sum ? "" : " pending"}" title="${escape(
+                  `${exactSize} · verify with: sha256sum ${name}`,
+                )}">${escape(sumText)}</code>
+              </li>`;
+          })
+          .join("");
+      }
+
+      function renderBackup(info, backup) {
+        const state = $("backup-state");
+        const stateLabel = $("backup-state-label");
+        const errorBox = $("backup-error");
+        const note = $("backup-note");
+        const last = backup?.lastBackup ?? null;
+        // Blocks between the newest archive and the tip, computed once: both the
+        // health check and the Archived height row read it.
+        const behind = last
+          ? Number(info?.height) - Number(last.height)
+          : Number.NaN;
+
+        let level = "unknown";
+        let label = "status unavailable";
+        errorBox.hidden = true;
+        note.hidden = true;
+
+        const nextRunMissing =
+          Boolean(backup?.enabled) &&
+          !backup.nextRunAt &&
+          !backup.waitingForSync;
+        let nextRunMissingFor = null;
+        if (nextRunMissing) {
+          if (backupNextRunMissingSince === null) {
+            backupNextRunMissingSince = Date.now();
+          }
+          const reference = Date.parse(backup.lastAttemptAt ?? last?.at);
+          const since = Number.isFinite(reference)
+            ? Math.min(reference, backupNextRunMissingSince)
+            : backupNextRunMissingSince;
+          nextRunMissingFor = Date.now() - since;
+        } else {
+          backupNextRunMissingSince = null;
+        }
+
+        if (!backup) {
+          note.textContent = "This node does not expose /api/backup.";
+          note.hidden = false;
+        } else if (!backup.enabled) {
+          level = "off";
+          label = "disabled";
+          note.textContent = "Start the node with --backup-dir to enable automatic backups.";
+          note.hidden = false;
+        } else if (!last) {
+          level = backup.lastError ? "bad" : "warn";
+          label = backup.lastError
+            ? "failing"
+            : backup.waitingForSync
+              ? "waiting for sync"
+              : "waiting";
+          if (!backup.lastError) {
+            // Read from this payload, not the cached copy: the cache is updated
+            // further down and would lag a refresh behind here.
+            const waited =
+              backup.waitingForSync && Number.isFinite(backup.syncWaitedMs)
+                ? backup.syncWaitedMs
+                : null;
+            note.textContent = backup.waitingForSync
+              ? `Waiting for the initial peer sync${
+                  Number.isFinite(waited) ? ` for ${duration(waited)}` : ""
+                }; the first backup runs once it settles.`
+              : "The first backup is scheduled after startup.";
+            note.hidden = false;
+          }
+        } else {
+          const ageMs = Date.now() - Date.parse(last.at);
+          // The node reports the configured staleness limit; older nodes that do
+          // not are judged by the historical rule of twice the interval.
+          const graceMs = Number.isFinite(backup.maxAgeMs)
+            ? backup.maxAgeMs
+            : Math.max(Number(backup.intervalMs) * 2, 60000);
+          const failedSinceLast =
+            backup.lastError &&
+            backup.lastAttemptAt &&
+            Date.parse(backup.lastAttemptAt) >= Date.parse(last.at);
+          // A recent archive can still be far behind: the chain grows between
+          // runs, so age alone does not say whether the copy is usable.
+          if (failedSinceLast) {
+            level = "bad";
+            label = "last attempt failed";
+          } else if (Number.isFinite(ageMs) && ageMs > graceMs) {
+            level = "warn";
+            label = "overdue";
+            note.textContent = `No successful backup for ${duration(ageMs)}; the limit is ${duration(graceMs)}.`;
+            note.hidden = false;
+          } else if (Number.isFinite(behind) && behind > BACKUP_LAG_BLOCKS) {
+            level = "warn";
+            label = "behind tip";
+            note.textContent = `The newest archive is ${formatNumber(
+              behind,
+            )} blocks behind the tip (limit ${BACKUP_LAG_BLOCKS}); it is newer than the age limit but no longer represents the chain.`;
+            note.hidden = false;
+          } else {
+            level = "ok";
+            label = "healthy";
+          }
+        }
+
+        if (
+          nextRunMissing &&
+          Number.isFinite(nextRunMissingFor) &&
+          nextRunMissingFor >= NO_NEXT_RUN_GRACE_MS
+        ) {
+          level = "bad";
+          label = "no next run";
+          note.textContent = `Automatic backups are enabled, but no next run has been scheduled for ${duration(nextRunMissingFor)}. The backup timer may have stopped; restart the node.`;
+          note.hidden = false;
+        }
+
+        state.className = `health ${level}`;
+        stateLabel.textContent = label;
+
+        if (last) {
+          $("backup-last").textContent = `${ageIso(last.at)} · ${utcTime(last.at)}`;
+          $("backup-last").title = last.at;
+          const lagText = !Number.isFinite(behind)
+            ? ""
+            : behind <= 0
+              ? "at tip"
+              : `${formatNumber(behind)} block${behind === 1 ? "" : "s"} behind tip`;
+          // The archive's size sits with its height: together they say how much
+          // history the file holds and how big the copy on disk is. When the
+          // node records the uncompressed size, the gzip saving is shown too.
+          const sizeText = Number.isFinite(last.bytes)
+            ? ` · ${fileSize(last.bytes)}`
+            : "";
+          const savedPercent =
+            Number.isFinite(last.rawBytes) && last.rawBytes > last.bytes
+              ? Math.round((1 - last.bytes / last.rawBytes) * 100)
+              : null;
+          const savedText = savedPercent === null ? "" : ` · saved ${savedPercent}%`;
+          $("backup-height").textContent = `#${formatNumber(last.height)}${lagText ? ` · ${lagText}` : ""}${sizeText}${savedText}`;
+          if (Number.isFinite(last.bytes)) {
+            $("backup-height").title =
+              `${formatNumber(last.bytes)} bytes gzipped${
+                savedPercent === null
+                  ? ""
+                  : ` (from ${formatNumber(last.rawBytes)}, ${savedPercent}% smaller)`
+              }`;
+          } else {
+            $("backup-height").removeAttribute("title");
+          }
+          $("backup-path").textContent = last.path;
+          $("backup-path").title = last.path;
+        } else {
+          $("backup-last").textContent = "—";
+          $("backup-last").removeAttribute("title");
+          $("backup-height").textContent = "—";
+          $("backup-height").removeAttribute("title");
+          $("backup-path").textContent = "—";
+          $("backup-path").removeAttribute("title");
+        }
+
+        renderArchives(backup);
+
+        const retained = ["hourly", "daily", "weekly"]
+          .filter((tier) => Number.isInteger(backup?.retention?.[tier]) && backup.retention[tier] > 0)
+          .map((tier) => `${tier} ${formatNumber(backup.retention[tier])}`)
+          .join(" · ");
+
+        $("backup-schedule").textContent = backup?.enabled
+          ? `every ${duration(backup.intervalMs)} · keep ${retained || "nothing"} · recoveries ${
+              formatNumber(backup.recoveryHistoryLimit ?? 5)
+            }${
+              Number.isFinite(backup.firstDelayMs)
+                ? ` · first delay ${duration(backup.firstDelayMs)}`
+                : ""
+            }${
+              Number.isFinite(backup.maxAgeMs)
+                ? ` · max age ${duration(backup.maxAgeMs)}`
+                : ""
+            }`
+          : "—";
+
+        const recoveryHistory = Array.isArray(backup?.recoveryHistory)
+          ? backup.recoveryHistory
+          : [];
+        const recovery = recoveryHistory[0] ?? backup?.lastRecovery ?? null;
+        if (recovery?.at && recovery.reason) {
+          $("backup-recovery").textContent = `${ageIso(recovery.at)} · ${recovery.reason}`;
+          $("backup-recovery").title = `${utcTime(recovery.at)} · ${recovery.reason}`;
+        } else {
+          $("backup-recovery").textContent = "—";
+          $("backup-recovery").removeAttribute("title");
+        }
+
+        const earlierRecoveries = recoveryHistory.slice(1);
+        const recoveryHistoryBox = $("backup-recovery-history");
+        recoveryHistoryBox.replaceChildren();
+        if (earlierRecoveries.length === 0) {
+          recoveryHistoryBox.textContent = "—";
+        } else {
+          for (const entry of earlierRecoveries) {
+            const line = document.createElement("span");
+            line.className = "recovery-entry";
+            line.textContent = `${ageIso(entry.at)} · ${entry.reason}`;
+            line.title = `${utcTime(entry.at)} · ${entry.reason}`;
+            recoveryHistoryBox.append(line);
+          }
+        }
+
+        // Node identity in one row beside the schedule: two nodes on one
+        // machine keep separate data directories and ports, so the pid and the
+        // address peers were told are what tells their panels apart.
+        const pid = Number(info?.pid);
+        const pidText = Number.isFinite(pid) ? `pid ${String(pid)}` : "—";
+        $("backup-node-pid").textContent = pidText;
+        // startedAt is epoch milliseconds, so Date.parse would reject it.
+        const startedAt = Number(info?.startedAt);
+        const upSince =
+          Number.isFinite(startedAt) && startedAt > 0 ? utcTime(startedAt) : null;
+        // The counter between refreshes reads this, so a node that restarts is
+        // picked up on the next poll rather than counting from the old start.
+        nodeStartedAt = Number.isFinite(startedAt) && startedAt > 0 ? startedAt : null;
+        renderNodeUptime();
+        const announced = typeof info?.announce === "string" ? info.announce : "";
+        const addressBox = $("backup-node-announce");
+        // The separator belongs to the address, so a node with no announced
+        // address does not leave a dangling dot behind.
+        addressBox.textContent = announced ? `· ${announced}` : "";
+        addressBox.hidden = announced.length === 0;
+        // One tooltip for the row: the full address, which the row may elide,
+        // and when this process started.
+        const identity = [pidText, announced].filter(Boolean).join(" · ");
+        $("backup-node").title = upSince ? `${identity} · up since ${upSince}` : identity;
+
+        backupEnabled = Boolean(backup?.enabled);
+        backupWaitingForSync = Boolean(backup?.waitingForSync);
+        // Only trust the figure while the node is waiting; a stale value would
+        // otherwise keep counting up after the first backup has run.
+        backupSyncWaitedMs =
+          backupWaitingForSync && Number.isFinite(backup?.syncWaitedMs)
+            ? backup.syncWaitedMs
+            : null;
+        backupSyncWaitedAt = Date.now();
+        backupFirstDelayMs = Number.isFinite(backup?.firstDelayMs)
+          ? backup.firstDelayMs
+          : null;
+        // The first wait is the configured delay; later waits are the interval.
+        // A recovered schedule can preserve a partial remainder, which the ring
+        // reads as further along than a fresh interval would be.
+        const span = backup?.lastBackup
+          ? backup?.intervalMs
+          : Number.isFinite(backup?.firstDelayMs)
+            ? backup.firstDelayMs
+            : backup?.intervalMs;
+        backupCycleMs = Number.isFinite(span) && span > 0 ? span : null;
+        const nextRun = backup?.enabled && backup.nextRunAt
+          ? Date.parse(backup.nextRunAt)
+          : Number.NaN;
+        nextBackupAt = Number.isFinite(nextRun) ? nextRun : null;
+        renderNextBackup();
+        $("backup-now").disabled = backupInFlight || !backupEnabled;
+        $("backup-now").title = backupEnabled
+          ? "Write and verify a backup now"
+          : "Automatic backups are not enabled";
+
+        if (backup?.lastError) {
+          errorBox.textContent = `Last error: ${backup.lastError}`;
+          errorBox.hidden = false;
+        }
+      }
+
+      async function get(path) {
+        const response = await fetch(path, { cache: "no-store" });
+        if (!response.ok) throw new Error(path);
+        return response.json();
+      }
+
+      let miningEnabled = false;
+      let miningInFlight = false;
+      let mineNoteTimer = null;
+
+      function showMineNote(text, bad = false) {
+        const note = $("mine-note");
+        note.textContent = text;
+        note.className = bad ? "mine-note bad" : "mine-note";
+        clearTimeout(mineNoteTimer);
+        mineNoteTimer = setTimeout(() => {
+          note.textContent = "";
+          note.className = "mine-note";
+        }, 8000);
+      }
+
+      // Pauses or resumes this node's miner through POST /api/mining. Pausing
+      // leaves peers, sync and backups running, so it is safe on a live node.
+      async function toggleMining() {
+        if (miningInFlight) return;
+        const button = $("mine-toggle");
+        const wanted = !miningEnabled;
+        miningInFlight = true;
+        button.disabled = true;
+        button.textContent = wanted ? "Resuming…" : "Pausing…";
+        try {
+          const response = await fetch("/api/mining", {
+            method: "POST",
+            cache: "no-store",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ enabled: wanted }),
+          });
+          const payload = await response.json().catch(() => ({}));
+          if (!response.ok) {
+            throw new Error(
+              payload.error || `mining request failed (${response.status})`,
+            );
+          }
+          miningEnabled = payload.mining === true;
+          showMineNote(
+            `${miningEnabled ? "Mining resumed" : "Mining paused"} at height ${formatNumber(payload.height)}.`,
+          );
+        } catch (error) {
+          showMineNote(error.message, true);
+        } finally {
+          miningInFlight = false;
+          button.disabled = false;
+          await refresh();
+        }
+      }
+
+      // A switch is announced for ten minutes: long enough to notice, short
+      // enough that an overnight reorg does not read as a live problem.
+      const REORG_NOTE_MS = 10 * 60 * 1000;
+
+      function renderReorg(info) {
+        const box = $("reorg-note");
+        const reorg = info?.lastReorg ?? null;
+        const at = Date.parse(reorg?.at);
+        if (!reorg || !Number.isFinite(at) || Date.now() - at > REORG_NOTE_MS) {
+          box.hidden = true;
+          return;
+        }
+        const tip = String(reorg.tip ?? "");
+        $("reorg-text").textContent =
+          `fork at #${formatNumber(reorg.forkHeight)} · new tip #${formatNumber(reorg.height)}` +
+          (tip ? ` ${tip.slice(0, 16)}…` : "") +
+          ` · ${ageIso(reorg.at)}`;
+        box.title =
+          `${formatNumber(reorg.added)} block(s) adopted from ${reorg.peer ?? "a peer"} ` +
+          `at ${utcTime(reorg.at)}; new tip ${tip}`;
+        box.hidden = false;
+      }
+
+      // The last peer check of the announced address. Nothing inside the node
+      // can prove its own address works from outside, so the header reports
+      // which peer was asked, whether it got through and how long ago.
+      function renderReachability(result) {
+        const badge = $("reachability");
+        const checked = result && typeof result.url === "string";
+        if (!checked) {
+          badge.hidden = true;
+          badge.textContent = "";
+          badge.title = "";
+          return;
+        }
+
+        const reachable = result.reachable === true;
+        const error = typeof result.error === "string" ? result.error : "";
+        const peer = result.peer ? ` from ${result.peer}` : "";
+        const when = result.at
+          ? ` at ${utcTime(result.at)} (${ageIso(result.at)})`
+          : "";
+        badge.hidden = false;
+        badge.className = `reach ${reachable ? "good" : "bad"}`;
+        badge.textContent = reachable ? "reachable" : "unreachable";
+        badge.title = reachable
+          ? `a peer reached this node${peer}${when}`
+          : `a peer could not reach this node${peer}${when}${error ? `: ${error}` : ""}`;
+      }
+
+      // Per-peer byte totals since the node started. A peer that has dropped
+      // out keeps its row, greyed, so a node that just went quiet still shows
+      // what it cost while it was connected.
+      function renderPeerTraffic(traffic) {
+        const entries = Array.isArray(traffic?.peers) ? traffic.peers : [];
+        const sent = Number(traffic?.sent);
+        const received = Number(traffic?.received);
+        const total = $("peer-traffic");
+
+        if (entries.length === 0) {
+          total.textContent = "no traffic yet";
+          total.title = "This node has not exchanged bytes with a peer since it started";
+        } else {
+          total.textContent = `${formatBytes(received)} in · ${formatBytes(sent)} out`;
+          total.title =
+            `${formatNumber(received)} bytes received and ${formatNumber(sent)} bytes sent ` +
+            `across ${entries.length} peer${entries.length === 1 ? "" : "s"} since this node started`;
+        }
+
+        $("peers").innerHTML = entries
+          .map(
+            (entry) => `
+              <tr>
+                <td class="mono peer-url${entry.connected ? "" : " muted"}" title="${escape(entry.peer)}${entry.connected ? "" : " (no longer connected)"}">${escape(entry.peer)}</td>
+                <td>${formatBytes(entry.received)}</td>
+                <td>${formatBytes(entry.sent)}</td>
+                <td class="muted">${formatNumber(entry.requests)} request${entry.requests === 1 ? "" : "s"} · ${ageIso(entry.lastAt)}</td>
+              </tr>`,
+          )
+          .join("") || `<tr><td colspan="4" class="empty">No peer traffic since this node started.</td></tr>`;
+      }
+
+      async function refresh() {
+        try {
+          const [info, blocks, mempool, backup] = await Promise.all([
+            get("/api/info"),
+            get("/api/blocks?limit=12"),
+            get("/api/mempool"),
+            get("/api/backup").catch(() => null),
+          ]);
+
+          $("network").textContent = info.network;
+          // The pill describes the miner, not the node: a node whose miner was
+          // stopped is still serving peers, syncing and backing up, so "live"
+          // hid the one thing an operator just changed.
+          $("status").textContent = info.mining ? "mining" : "paused";
+          $("status").title = info.mining
+            ? "Miner running; peers, sync and backups continue either way"
+            : "Miner stopped; the node is still serving peers, syncing and backing up";
+          $("dot").classList.remove("offline");
+
+          miningEnabled = info.mining === true;
+          if (!miningInFlight) {
+            const button = $("mine-toggle");
+            button.disabled = false;
+            button.textContent = miningEnabled ? "Pause mining" : "Resume mining";
+            button.title = miningEnabled
+              ? "Stop this node's miner without stopping the node"
+              : "Start this node's miner";
+          }
+
+          // The address this node hands to peers, which is often not the URL
+          // this page was opened on (a wildcard bind or an --announce name).
+          const announceUrl =
+            typeof info.announce === "string" ? info.announce : "";
+          $("announce").textContent = announceUrl;
+          $("announce").title = announceUrl
+            ? `peers are told to reach this node at ${announceUrl}`
+            : "";
+          $("announce-block").hidden = announceUrl.length === 0;
+          renderReachability(info.reachability);
+
+          $("height").textContent = formatNumber(info.height);
+          $("tip-age").textContent = `tip ${age(info.time)}`;
+          $("supply").textContent = formatNumber(info.supply, 4);
+          $("supply-bar").style.width = `${Math.min(100, (Number(info.supply) / supplyCap) * 100).toFixed(3)}%`;
+          $("difficulty").textContent = formatNumber(info.difficulty, 2);
+          $("next-subsidy").textContent = `${formatNumber(info.nextSubsidy, 0)} DBL per block`;
+          $("chain-work").textContent = formatWork(info.work);
+          $("chain-work").title = `${info.work ?? "unknown"} work`;
+          $("chain-work-note").textContent = "since genesis";
+          $("mempool-count").textContent = formatNumber(mempool.count);
+          $("peer-count").textContent = `${info.peers} peer${info.peers === 1 ? "" : "s"} connected`;
+          renderPeerTraffic(info.peerTraffic);
+          $("network-note").textContent = `${info.network} · best ${String(info.bestBlockHash).slice(0, 16)}…`;
+          renderBackup(info, backup);
+          renderReorg(info);
+
+          $("blocks").innerHTML = blocks.blocks
+            .map(
+              (block) => `
+                <tr>
+                  <td class="height">#${formatNumber(block.height)}</td>
+                  <td><a class="mono hash" href="/api/blocks/${block.height}" title="${escape(block.hash)}">${escape(block.hash.slice(0, 20))}…</a></td>
+                  <td class="muted">${age(block.time)}</td>
+                  <td>${formatNumber(block.transactions)}</td>
+                  <td class="muted">${formatNumber(block.size)} B</td>
+                </tr>`,
+            )
+            .join("");
+
+          if (mempool.count === 0) {
+            $("mempool").className = "empty";
+            $("mempool").textContent = "No pending transactions.";
+            $("mempool-note").textContent = "";
+          } else {
+            $("mempool").className = "";
+            $("mempool-note").textContent = `${mempool.count} waiting`;
+            $("mempool").innerHTML = mempool.transactions
+              .slice(0, 6)
+              .map(
+                (transaction) => `
+                  <div class="facts">
+                    <div>
+                      <dt class="mono">${escape(transaction.txid.slice(0, 18))}…</dt>
+                      <dd>${escape(transaction.fee)} DBL fee</dd>
+                    </div>
+                  </div>`,
+              )
+              .join("");
+          }
+        } catch {
+          $("status").textContent = "offline";
+          $("status").title = "No answer from the node; it may have stopped";
+          $("dot").classList.add("offline");
+          $("mine-toggle").disabled = true;
+        }
+      }
+
+      // The node answers a manual backup with a job id and writes the archive in
+      // the background, so the page polls that job instead of holding one
+      // request open for however long verifying a large chain takes.
+      async function followBackupJob(id) {
+        const started = Date.now();
+        for (;;) {
+          const payload = await get(`/api/backup/jobs/${encodeURIComponent(id)}`);
+          const job = payload?.job ?? null;
+          if (!job) throw new Error("the node has no record of this backup job");
+          if (job.state !== "running") return job;
+          if (Date.now() - started > 5 * 60 * 1000) {
+            throw new Error("timed out waiting for the backup to finish");
+          }
+          const seconds = Math.round((Date.now() - started) / 1000);
+          $("backup-action-status").textContent = `Writing and verifying archive… ${seconds}s`;
+          await new Promise((resolve) => setTimeout(resolve, 1000));
+        }
+      }
+
+      async function backupNow() {
+        if (backupInFlight) return;
+        const button = $("backup-now");
+        const actionStatus = $("backup-action-status");
+        if (button.disabled) return;
+
+        backupInFlight = true;
+        button.disabled = true;
+        button.textContent = "Backing up…";
+        actionStatus.className = "backup-action-status";
+        actionStatus.textContent = "Writing and verifying archive…";
+
+        try {
+          const response = await fetch("/api/backup", {
+            method: "POST",
+            cache: "no-store",
+          });
+          const started = await response.json().catch(() => ({}));
+          // 409 with a job means a run is already in flight (another tab, or the
+          // schedule got there first): follow that one instead of refusing.
+          const joins = response.status === 409 && started.job?.state === "running";
+          if (!response.ok && !joins) {
+            throw new Error(started.error || `backup failed (${response.status})`);
+          }
+          const job = started.job;
+          if (!job?.id) {
+            throw new Error(started.error || "the node did not return a backup job");
+          }
+          const finished = await followBackupJob(job.id);
+          if (finished.state !== "succeeded") {
+            throw new Error(finished.error || "the node reported the backup failed");
+          }
+          actionStatus.textContent = `Backup written at height ${formatNumber(
+            finished.backup?.height,
+          )}.`;
+          await refresh();
+        } catch (error) {
+          actionStatus.className = "backup-action-status bad";
+          actionStatus.textContent = `Backup failed: ${error.message}`;
+          await refresh();
+        } finally {
+          backupInFlight = false;
+          button.textContent = "Back up now";
+          button.disabled = !backupEnabled;
+        }
+      }
+
+      $("backup-now").addEventListener("click", backupNow);
+      $("mine-toggle").addEventListener("click", toggleMining);
+      refresh();
+      setInterval(refresh, 5000);
+      setInterval(renderNextBackup, 1000);
+      setInterval(renderNodeUptime, 1000);
+    </script>
+  </body>
+</html>

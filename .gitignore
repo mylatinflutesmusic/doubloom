@@ -1,0 +1,12 @@
+data/
+node_modules/
+*.log
+
+# Local scratch directories (.tmp, .tmp2, .tmp-cap, …).
+.tmp*/
+
+.DS_Store
+
+# Wallet backups are key material even when encrypted, and this is the filename
+# "./doubloom wallet backup" suggests, so they land next to it by default.
+wallet-backup.json*

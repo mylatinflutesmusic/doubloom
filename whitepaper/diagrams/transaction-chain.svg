@@ -1,0 +1,64 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 260" width="720" height="260" role="img" aria-labelledby="fig1-title fig1-desc">
+  <title id="fig1-title">A chain of Doubloom transactions</title>
+  <desc id="fig1-desc">Transaction A pays 50 DBL to an address. Transaction B spends that output, signs the whole transaction, and creates two outputs. Transaction C spends one of B's outputs; the other outputs remain unspent.</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0 0 L8 4 L0 8 Z" fill="#14110c"/>
+    </marker>
+  </defs>
+  <style>
+    text { font-family: "Times New Roman", Times, serif; fill: #14110c; }
+    .box { fill: #fff; stroke: #14110c; stroke-width: 1.1; }
+    .head { fill: #f1ede3; stroke: #14110c; stroke-width: 1.1; }
+    .title { font-size: 15px; font-weight: bold; }
+    .body { font-family: "Courier New", Courier, monospace; font-size: 13px; }
+    .tiny { font-family: "Courier New", Courier, monospace; font-size: 11px; fill: #6b6459; }
+    .note { font-size: 13px; fill: #3f3a31; }
+    .label { font-family: "Courier New", Courier, monospace; font-size: 12px; fill: #6b6459; }
+    .arrow { stroke: #14110c; stroke-width: 1.1; fill: none; marker-end: url(#arrow); }
+    .bracket { stroke: #6b6459; stroke-width: 1; fill: none; }
+  </style>
+
+  <!-- Transaction A -->
+  <rect class="head" x="14" y="52" width="198" height="30" rx="3"/>
+  <rect class="box" x="14" y="82" width="198" height="110" rx="3"/>
+  <text class="title" x="27" y="74">Transaction A</text>
+  <text class="body" x="27" y="106">output 0</text>
+  <text class="body" x="27" y="126">50.00000000 DBL</text>
+  <text class="body" x="27" y="146">pay to hash160(D1)</text>
+  <text class="tiny" x="27" y="181">txid 9f2c…a71d</text>
+
+  <!-- Transaction B -->
+  <rect class="head" x="261" y="52" width="198" height="30" rx="3"/>
+  <rect class="box" x="261" y="82" width="198" height="110" rx="3"/>
+  <text class="title" x="274" y="74">Transaction B</text>
+  <text class="body" x="274" y="104">input   A:0</text>
+  <text class="body" x="274" y="124">sig     3045…8a</text>
+  <text class="body" x="274" y="144">out 0   30 DBL → D2</text>
+  <text class="body" x="274" y="164">out 1   19.99 → D1</text>
+  <text class="tiny" x="274" y="185">txid 0b7e…3c09</text>
+
+  <!-- Transaction C -->
+  <rect class="head" x="508" y="52" width="198" height="30" rx="3"/>
+  <rect class="box" x="508" y="82" width="198" height="110" rx="3"/>
+  <text class="title" x="521" y="74">Transaction C</text>
+  <text class="body" x="521" y="104">input   B:1</text>
+  <text class="body" x="521" y="124">sig     3045…2e</text>
+  <text class="body" x="521" y="144">out 0   19.99 → D3</text>
+  <text class="tiny" x="521" y="181">txid 7d3c…bc80</text>
+
+  <!-- Links: outputs spent as inputs -->
+  <path class="arrow" d="M212 122 H252"/>
+  <path class="arrow" d="M459 122 H499"/>
+  <text class="label" x="236" y="113" text-anchor="middle">A:0</text>
+  <text class="label" x="483" y="113" text-anchor="middle">B:1</text>
+
+  <!-- Signature coverage callout -->
+  <path class="bracket" d="M261 204 V212 H459 V204"/>
+  <text class="note" x="360" y="230" text-anchor="middle">signature covers all inputs and outputs,</text>
+  <text class="note" x="360" y="246" text-anchor="middle">and the value and address of A:0</text>
+
+  <!-- Unspent output callout -->
+  <text class="note" x="607" y="230" text-anchor="middle">C's output stays unspent</text>
+  <text class="note" x="607" y="246" text-anchor="middle">until another input names it</text>
+</svg>

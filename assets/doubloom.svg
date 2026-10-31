@@ -1,0 +1,51 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-label="Doubloom coin">
+  <title>Doubloom</title>
+  <desc>A golden coin bearing a double-barred D, the Doubloom mark.</desc>
+  <defs>
+    <radialGradient id="face" cx="36%" cy="26%" r="82%">
+      <stop offset="0%" stop-color="#ffefb4"/>
+      <stop offset="36%" stop-color="#f8d066"/>
+      <stop offset="70%" stop-color="#e2a72c"/>
+      <stop offset="100%" stop-color="#a96f10"/>
+    </radialGradient>
+    <linearGradient id="rim" x1="0.1" y1="0" x2="0.9" y2="1">
+      <stop offset="0%" stop-color="#fff3c4"/>
+      <stop offset="28%" stop-color="#edbb4c"/>
+      <stop offset="62%" stop-color="#bb7f17"/>
+      <stop offset="100%" stop-color="#7c4f08"/>
+    </linearGradient>
+    <linearGradient id="glyph" x1="0" y1="0" x2="0.35" y2="1">
+      <stop offset="0%" stop-color="#fffdf4"/>
+      <stop offset="55%" stop-color="#fff4d2"/>
+      <stop offset="100%" stop-color="#f0ce7e"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="50%" cy="50%" r="50%">
+      <stop offset="72%" stop-color="#ffd35c" stop-opacity="0"/>
+      <stop offset="100%" stop-color="#ffd35c" stop-opacity="0.32"/>
+    </radialGradient>
+    <filter id="lift" x="-25%" y="-25%" width="150%" height="150%">
+      <feDropShadow dx="0" dy="12" stdDeviation="14" flood-color="#3a2402" flood-opacity="0.55"/>
+    </filter>
+    <filter id="press" x="-25%" y="-25%" width="150%" height="150%">
+      <feDropShadow dx="0" dy="6" stdDeviation="5" flood-color="#6d4605" flood-opacity="0.55"/>
+    </filter>
+  </defs>
+
+  <g filter="url(#lift)">
+    <circle cx="512" cy="512" r="486" fill="url(#rim)"/>
+    <circle cx="512" cy="512" r="468" fill="#7c4e07" opacity="0.5"/>
+    <circle cx="512" cy="512" r="450" fill="url(#face)"/>
+  </g>
+
+  <circle cx="512" cy="512" r="468" fill="none" stroke="#fff4c8" stroke-opacity="0.32" stroke-width="10" stroke-dasharray="7 9"/>
+  <circle cx="512" cy="512" r="450" fill="none" stroke="#6d4506" stroke-opacity="0.4" stroke-width="4"/>
+  <circle cx="512" cy="512" r="430" fill="none" stroke="#fff6d0" stroke-opacity="0.45" stroke-width="3"/>
+  <ellipse cx="372" cy="296" rx="248" ry="158" fill="#ffffff" opacity="0.15"/>
+  <circle cx="512" cy="512" r="450" fill="url(#glow)"/>
+
+  <g transform="rotate(-8 512 512)" fill="url(#glyph)" filter="url(#press)">
+    <path fill-rule="evenodd" d="M352 280H520C650 280 730 375 730 512C730 649 650 744 520 744H352V280ZM438 368H516C594 368 644 426 644 512C644 598 594 656 516 656H438V368Z"/>
+    <rect x="250" y="392" width="520" height="44" rx="10"/>
+    <rect x="250" y="566" width="520" height="44" rx="10"/>
+  </g>
+</svg>
