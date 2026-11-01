@@ -21,6 +21,29 @@ function isGzip(buffer) {
 }
 
 /**
+ * When the export at `file` was written, as an ISO timestamp.
+ *
+ * A wallet backup is a gzip of the wallet, and gzip's header has a standard
+ * MTIME field (bytes 4-7, little endian). The export time is written there, so
+ * the stamp travels with the file's bytes and survives being copied to another
+ * machine — which resets the file's own times. Exports written before this was
+ * recorded carry zero in that field; those fall back to the file's modification
+ * time, which is when the archive was written until something copies it without
+ * preserving times. Plain-JSON exports from before compression fall back the
+ * same way.
+ */
+export function backupArchiveTime(file) {
+  const stored = fs.readFileSync(file);
+  if (isGzip(stored) && stored.length >= 8) {
+    const seconds = stored.readUInt32LE(4);
+    if (seconds > 0) {
+      return new Date(seconds * 1000).toISOString();
+    }
+  }
+  return fs.statSync(file).mtime.toISOString();
+}
+
+/**
  * Read a wallet or wallet backup as plain JSON bytes, decompressing on the way.
  * Backups written before compression existed are plain JSON and still load, so
  * an old export restores with the current code.
@@ -276,6 +299,27 @@ export class Wallet {
    * The source is re-read and unlocked with the passphrase, so the backup is
    * checked against the file on disk rather than any in-memory state. Plaintext
    * wallets are refused: an export must never contain readable private keys.
+   *
+   * The backup file format, which archives already on disk depend on:
+   *
+   *   bytes 0-1   `1f 8b` — gzip magic, the only thing that marks compression
+   *   byte  2     `08` — deflate, as gzip requires
+   *   byte  3     `00` — no optional header fields (no name, comment or CRC)
+   *   bytes 4-7   export time, unix seconds, little endian, in gzip's MTIME
+   *               field; zlib writes zero and it is patched here. Read as an
+   *               ISO stamp by `backupArchiveTime`, and it is the only thing in
+   *               the container that is not the wallet itself
+   *   bytes 8-9   XFL and OS — written by zlib, never read back
+   *   body        deflate of the wallet file, byte for byte: the same version 2
+   *               JSON (encrypted keys, no plaintext) that the live wallet holds
+   *   trailer     CRC-32 of the uncompressed wallet, then its length, both
+   *               little endian — gzip's standard, which zlib checks on read
+   *
+   * A plain-JSON wallet file is also accepted on restore, for exports written
+   * before compression. Nothing here is versioned separately from the wallet
+   * JSON: the payload's `version` field is the wallet's own (2 today), and a
+   * future container change must keep `backupArchiveTime` and `readWalletBytes`
+   * able to read what this writes, or accept the old shape alongside a new one.
    */
   backup(destination, passphrase) {
     // Backups are gzip, like node archives, and named to say so. A destination
@@ -294,6 +338,10 @@ export class Wallet {
 
     const raw = fs.readFileSync(this.file);
     const bytes = zlib.gzipSync(raw);
+    // zlib leaves gzip's MTIME field zero; record the export time in it so the
+    // archive can say when it was made even after being copied elsewhere. The
+    // checksum covers the uncompressed data, not the header, so this is safe.
+    bytes.writeUInt32LE(Math.floor(Date.now() / 1000), 4);
     fs.mkdirSync(path.dirname(target), { recursive: true });
     try {
       fs.writeFileSync(target, bytes, { flag: 'wx', mode: 0o600 });
@@ -318,6 +366,10 @@ export class Wallet {
         bytes: bytes.length,
         rawBytes: raw.length,
         keys: copy.listKeys().length,
+        // The stamp stored in the archive, read back the way `restore` reads it
+        // rather than echoed from the clock, so what is printed now is what will
+        // be printed when this export is restored.
+        at: backupArchiveTime(target),
       };
     } catch (error) {
       fs.rmSync(target, { force: true });

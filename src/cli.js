@@ -4,7 +4,7 @@ import path from 'node:path';
 import process from 'node:process';
 import { MAX_MONEY, NETWORKS, networkParams } from './params.js';
 import { Chain, subsidyAt } from './chain.js';
-import { Wallet } from './wallet.js';
+import { Wallet, backupArchiveTime } from './wallet.js';
 import { loadChain, saveChain } from './store.js';
 import { formatAmount } from './amount.js';
 import { headerHash, mineHeader } from './block.js';
@@ -1746,6 +1746,12 @@ passphrase no longer works. Back up the new one offline.${RESET}\n`,
         const result = wallet.backup(path.resolve(destination), passphrase);
         console.log(`\n${GOLD}Backup written and verified${RESET}\n`);
         row('file', result.path);
+        // The same stamp `wallet restore` prints, so an operator can match the
+        // export they made against the one they later restored.
+        row(
+          'backup time',
+          `${isoTimestamp(result.at)} ${DIM}(${timeAgo(result.at)})${RESET}`,
+        );
         row(
           'size',
           `${result.bytes.toLocaleString()} bytes gzipped ${DIM}(from ${result.rawBytes.toLocaleString()})${RESET}`,
@@ -1772,16 +1778,26 @@ passphrase. Restore it with: doubloom wallet restore <file>${RESET}\n`,
         const passphrase = await readPassphrase(
           'Enter the passphrase for the backup: ',
         );
+        const sourcePath = path.resolve(source);
         const wallet = Wallet.restore(
-          path.resolve(source),
+          sourcePath,
           ctx.walletFile,
           ctx.params,
           passphrase,
           { force: Boolean(flags.force) },
         );
+        // Read from the archive itself, not the clock: this is when the export
+        // being installed was made, not when it is being installed. Read after
+        // the restore so a missing file reports the restore's own error.
+        const backedUpAt = backupArchiveTime(sourcePath);
         console.log(`\n${GOLD}Wallet restored and verified${RESET}\n`);
+        row(
+          'backup time',
+          `${isoTimestamp(backedUpAt)} ${DIM}(${timeAgo(backedUpAt)})${RESET}`,
+        );
         row('file', ctx.walletFile);
-        row('keys', String(wallet.listKeys().length));
+        const keyCount = wallet.listKeys().length;
+        row('keys', `${keyCount} ${DIM}from this backup${RESET}`);
         row('cipher', 'aes-256-gcm');
         for (const key of wallet.listKeys()) {
           console.log(
