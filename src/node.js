@@ -49,6 +49,17 @@ const PEER_CHECK_DELAY_MS = 500;
  */
 const ANNOUNCE_REFRESH_INTERVAL_MS = 30_000;
 
+/** Header a relayed request carries, naming the peer that sent it. */
+const PEER_HEADER = 'x-doubloom-from';
+/**
+ * How long a rejected push is still the fork being timed. Long enough to cover
+ * the fetch's debounce and a periodic pass, short enough that a reorg minutes
+ * later is reported as its own event rather than a slow answer to this push.
+ */
+const FORK_WATCH_MS = 60_000;
+/** Log levels, widest first; see the `log` helper in `startNode`. */
+const LOG_LEVELS = ['full', 'blocks', 'quiet'];
+
 const EXPLORER_FILE = fileURLToPath(new URL('./explorer.html', import.meta.url));
 const COIN_FILE = fileURLToPath(new URL('../assets/doubloom.svg', import.meta.url));
 
@@ -234,6 +245,27 @@ function summarizeBlock(block, height) {
 
 export function startNode(options) {
   const { chain, params, chainFile } = options;
+  // Widest first: a level prints its own events and every one before it. The
+  // default writes the log this node has always written; `blocks` drops the
+  // per-transaction lines that a busy mempool would otherwise bury the chain
+  // events under, and `quiet` leaves only warnings and errors.
+  const logLevel = options.logLevel ?? 'full';
+  if (!LOG_LEVELS.includes(logLevel)) {
+    throw new Error(
+      `unknown log level "${logLevel}" (expected ${LOG_LEVELS.join(' or ')})`,
+    );
+  }
+  const logRank = LOG_LEVELS.indexOf(logLevel);
+  /**
+   * Write one line if it belongs to this node's log level. Warnings and errors
+   * do not come through here: a quiet node is still expected to say when
+   * something went wrong.
+   */
+  const log = (level, message) => {
+    if (LOG_LEVELS.indexOf(level) >= logRank) {
+      console.log(message);
+    }
+  };
   const wallet = options.wallet ?? null;
   const host = options.host ?? '127.0.0.1';
   const port = options.port ?? params.defaultPort;
@@ -503,12 +535,12 @@ export function startNode(options) {
     return delivered.filter(Boolean);
   }
 
-  function relay(endpoint, payload, label) {
+  function relay(endpoint, payload, label, level = 'blocks') {
     broadcast(endpoint, payload).then((delivered) => {
       // A broadcast still in flight when the node stops has nowhere useful to
       // log to, and shutdown has already been reported.
       if (!stopped && delivered.length > 0) {
-        console.log(`relayed ${label} to ${formatPeers(delivered.length)}`);
+        log(level, `relayed ${label} to ${formatPeers(delivered.length)}`);
       }
     });
   }
@@ -559,7 +591,7 @@ export function startNode(options) {
       };
 
       if (added > 0) {
-        console.log(
+        log('blocks',
           `DNS seed discovery: ${added} new peer${
             added === 1 ? '' : 's'
           } from ${result.resolved.join(', ')}`,
@@ -708,7 +740,7 @@ export function startNode(options) {
       // starting up is a single line to look for in the log.
       if (startupSyncPending && passPeers > 0) {
         startupSyncPending = false;
-        console.log(
+        log('blocks',
           passBlocks > 0
             ? `startup sync: ${passBlocks} block(s), ${formatBytes(passBytes)} from ${formatPeers(passPeers)} · height ${chain.height}`
             : `startup sync: up to date at height ${chain.height} (${formatBytes(passBytes)} from ${formatPeers(passPeers)})`,
@@ -956,7 +988,7 @@ export function startNode(options) {
       }
       const changed = setMining(body.enabled);
       if (changed) {
-        console.log(
+        log('blocks',
           body.enabled
             ? `mining resumed via API to ${minerAddress}`
             : `mining paused via API at height ${chain.height}`,
@@ -1497,7 +1529,7 @@ export function startNode(options) {
         );
       } else if (previous === null || !previous.reachable) {
         // First successful check, or a recovery from a failed one.
-        console.log(`announced address ${announceUrl} is reachable from ${peer}`);
+        log('blocks', `announced address ${announceUrl} is reachable from ${peer}`);
       }
       return result;
     }
@@ -1551,7 +1583,7 @@ export function startNode(options) {
         const mined = chain.addBlock(block);
         knownHashes.add(mined.hash);
         saveChain(chain, chainFile);
-        console.log(
+        log('blocks',
           `mined block ${chain.height} ${mined.hash} (${
             block.transactions.length
           } tx, reward ${formatAmount(
@@ -1649,7 +1681,7 @@ export function startNode(options) {
         `warning: no routable address found; announcing ${next} until an interface returns (set --announce to pin one)`,
       );
     } else {
-      console.log(
+      log('blocks',
         `announced address changed from ${previous} to ${next} (network interface changed); re-announcing to peers`,
       );
     }
@@ -1664,7 +1696,7 @@ export function startNode(options) {
         return;
       }
       if (delivered.length > 0) {
-        console.log(
+        log('blocks',
           `re-announced ${announceUrl} to ${formatPeers(delivered.length)}`,
         );
       }
@@ -1691,8 +1723,8 @@ export function startNode(options) {
         announceUrl = selfUrl;
       }
     }
-    console.log(`Doubloom ${params.name} node listening on ${selfUrl}`);
-    console.log(`Block explorer: ${selfUrl}`);
+    log('blocks', `Doubloom ${params.name} node listening on ${selfUrl}`);
+    log('blocks', `Block explorer: ${selfUrl}`);
     // Recorded next to the chain so `doubloom info` can report where peers
     // were told to find this node, which is not derivable from the chain file.
     recordNodeState();
@@ -1706,7 +1738,7 @@ export function startNode(options) {
       announceRefreshTimer.unref?.();
     }
     if (announceUrl !== selfUrl) {
-      console.log(
+      log('blocks',
         `Announcing ${announceUrl} to peers${
           announceInterface === null ? '' : ` (interface ${announceInterface})`
         }`,
@@ -1716,25 +1748,25 @@ export function startNode(options) {
       options.announce === undefined &&
       announceUrl === selfUrl
     ) {
-      console.log(
+      log('blocks',
         announceInterface === null
           ? 'No routable address found on this machine; announcing the loopback address (set --announce)'
           : `Interface ${announceInterface} has no routable address yet; announcing the loopback address until it gets one`,
       );
     }
-    console.log(`Data file: ${chainFile}`);
+    log('blocks', `Data file: ${chainFile}`);
     if (seeds.length > 0) {
-      console.log(`DNS seeds: ${seeds.join(', ')} (up to ${maxPeers} peers)`);
+      log('blocks', `DNS seeds: ${seeds.join(', ')} (up to ${maxPeers} peers)`);
     } else if (peers.size === 0) {
-      console.log(
+      log('blocks',
         'No DNS seeds configured and no peers given; add --seed or --peers',
       );
     }
     if (peers.size > 0) {
-      console.log(`Peers: ${[...peers].join(', ')}`);
+      log('blocks', `Peers: ${[...peers].join(', ')}`);
     }
     if (mining) {
-      console.log(`Mining to ${minerAddress}`);
+      log('blocks', `Mining to ${minerAddress}`);
     }
     if (backupSchedule) {
       const minutes = Number((backupSchedule.intervalMs / 60_000).toFixed(3));

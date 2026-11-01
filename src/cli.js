@@ -85,6 +85,9 @@ ${BOLD}Options${RESET}
   --peers <url,url>          Comma-separated peer nodes
   --seed <host[:port],...>   DNS seeds to resolve for peer discovery
   --no-seed                  Ignore all DNS seeds
+  --log-level <level>        full | blocks | quiet (default full): "blocks"
+                             drops the per-transaction lines, "quiet" keeps
+                             only warnings and errors
   --mine                     Mine while running the node
   --backup-dir <path>        Write verified backups while the node runs
   --backup-first-delay <sec> Seconds before the first backup (default 10)
@@ -2030,6 +2033,10 @@ passphrase. Restore it with: doubloom wallet restore <file>${RESET}\n`,
         seeds,
         mine: Boolean(flags.mine),
         minerAddress: address,
+        logLevel:
+          flags['log-level'] === undefined
+            ? undefined
+            : String(flags['log-level']),
         backup,
       });
 
