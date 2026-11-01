@@ -14,6 +14,12 @@ import { listArchives, startBackupSchedule } from './backup-scheduler.js';
 import { createBackupWorker } from './backup-thread.js';
 import { discoverSeedPeers, parseSeed } from './peer-discovery.js';
 import { nodeStateFile, saveNodeState } from './node-state.js';
+import {
+  appendReorg,
+  loadReorgHistory,
+  REORG_HISTORY_LIMIT,
+  reorgHistoryFile,
+} from './reorg-history.js';
 
 /** How often configured DNS seeds are re-resolved to replace dead peers. */
 const SEED_DISCOVERY_INTERVAL_MS = 300_000;
@@ -70,6 +76,37 @@ function sendJson(response, status, payload) {
     'cache-control': 'no-store',
   });
   response.end(body);
+}
+
+/** A peer URL as a bare origin, so `http://h:1/` and `http://h:1` match. */
+function normalizePeerUrl(value) {
+  if (typeof value !== 'string' || value.trim() === '') {
+    return null;
+  }
+  try {
+    const url = new URL(value.trim());
+    return url.protocol === 'http:' || url.protocol === 'https:'
+      ? url.origin
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+/** The host of a peer URL, or null when it does not parse. */
+function hostOfPeer(peer) {
+  try {
+    return new URL(peer).hostname;
+  } catch {
+    return null;
+  }
+}
+
+/** Socket addresses and URL hostnames spell the same host differently. */
+function normalizeHost(address) {
+  const text = String(address ?? '');
+  const bare = text.replace(/^\[|\]$/g, '');
+  return bare.startsWith('::ffff:') ? bare.slice('::ffff:'.length) : bare;
 }
 
 async function readJson(request, limit = 2_000_000) {
@@ -294,10 +331,23 @@ export function startNode(options) {
   // The startup pass gets one summary line once it has actually spoken to a
   // peer, so a seeded node reports the pass that included the peers it found.
   let startupSyncPending = true;
-  // The most recent switch to a heavier branch, so the explorer can say a
-  // reorg happened instead of leaving the new tip to be noticed by eye.
-  let lastReorg = null;
+  // Recent switches to a heavier branch, newest first and read back from disk:
+  // the newest one is what the explorer announces, and the rest are the history
+  // an operator looks at after an overnight reorg. A file that cannot be read
+  // simply starts the list empty rather than stopping the node.
+  const switchHistoryFile = reorgHistoryFile(chainFile);
+  let reorgHistory = loadReorgHistory({
+    file: switchHistoryFile,
+    network: params.name,
+  });
   let syncQueued = false;
+  // A peer that pushed a block we could not append, kept so the next pass asks
+  // it first instead of fanning out to every peer.
+  let syncQueuedPeer = null;
+  let syncPreference = null;
+  // The rejected push whose fork is still open, so the switch it leads to can
+  // be timed. Cleared when the fork settles or the window passes.
+  let forkWatch = null;
   let syncRequestTimer = null;
   let lastSyncRequestAt = 0;
   const reachabilityDelayMs =
@@ -694,26 +744,74 @@ export function startNode(options) {
               ? payload.from
               : null;
 
+          // Where this node stood before adopting, so a switch can report the
+          // branch that lost and not only the one that arrived.
+          const before = {
+            height: chain.height,
+            tip: headerHash(chain.tip.header),
+            work: chain.work,
+          };
+
           const result =
             from === null
               ? chain.adopt(payload.blocks)
               : chain.adopt(payload.blocks, { from });
           if (result.added > 0) {
+            // Named on the log line below, so a switch is readable from the log
+            // alone: an operator watching a node needs the fork point, both
+            // tips and how much heavier the winner was, not just "a reorg".
+            let reorgNote = '';
             if (result.reorg) {
-              lastReorg = {
+              // Both branches share everything up to the fork, so the work of
+              // our abandoned blocks is our old total minus the shared prefix.
+              const sharedWork = chain.work - chain.workAbove(result.fork);
+              const entry = {
                 at: new Date().toISOString(),
                 forkHeight: result.fork,
                 height: result.height,
                 tip: headerHash(chain.tip.header),
-                added: result.added,
                 peer,
+                added: result.added,
+                dropped: (result.dropped ?? []).length,
+                // The branch this node was on and left: its tip, the work it
+                // had accumulated, and the work of the blocks it lost.
+                lost: {
+                  height: before.height,
+                  hash: before.tip,
+                  work: before.work.toString(),
+                  workAboveFork: (before.work - sharedWork).toString(),
+                },
+                // How much heavier the adopted branch was, as exact work.
+                gained: (chain.work - before.work).toString(),
               };
+              try {
+                reorgHistory = appendReorg({
+                  file: switchHistoryFile,
+                  network: params.name,
+                  entry,
+                });
+              } catch (error) {
+                // The switch is already applied; losing the record of it is
+                // not worth failing the sync, but the list must stay current.
+                console.error(
+                  `could not record the chain switch: ${error.message}`,
+                );
+                reorgHistory = [entry, ...reorgHistory].slice(
+                  0,
+                  REORG_HISTORY_LIMIT,
+                );
+              }
               // The branch changed below the tip: drop the blocks that lost,
               // which adopt reports by hash, rather than rehashing every block
               // we kept.
               for (const hash of result.dropped ?? []) {
                 knownHashes.delete(hash);
               }
+              reorgNote =
+                ` · reorg at fork #${entry.forkHeight}: ` +
+                `#${entry.lost.height} ${entry.lost.hash.slice(0, 12)}… → ` +
+                `#${entry.height} ${entry.tip.slice(0, 12)}…, ` +
+                `+${entry.gained} work`;
             }
             // A straight extension keeps every hash we already know, and a
             // reorg keeps everything below the fork: either way only the blocks
@@ -791,6 +889,52 @@ export function startNode(options) {
     } catch {
       return false;
     }
+  }
+
+  /**
+   * How long the node took to move onto the heavier chain after refusing a
+   * pushed block. Only a switch counts — a plain extension does not settle a
+   * fork — and only inside the watch window, so a reorg that happens much later
+   * is left to its own record instead of being charged to this rejection.
+   */
+  function reportForkSettled(result) {
+    if (!result.reorg || !forkWatch) {
+      return;
+    }
+    const elapsed = Date.now() - forkWatch.at;
+    if (elapsed > FORK_WATCH_MS) {
+      forkWatch = null;
+      return;
+    }
+    log('blocks',
+      `adopted the heavier chain ${elapsed} ms after rejecting block ${forkWatch.hash.slice(0, 12)}… from ${forkWatch.peer}`,
+    );
+    forkWatch = null;
+  }
+
+  /**
+   * The URL of the peer that pushed a request, when it can be told. This node's
+   * own relays name themselves; a sender that does not (an older node, or curl)
+   * is matched by the address the request came from, but only when exactly one
+   * peer lives there. Either way the answer is a peer already in `peers`: the
+   * header arrives over plain HTTP, so it must not let anyone point the node at
+   * a URL of their choosing.
+   */
+  function senderPeer(request) {
+    const claimed = normalizePeerUrl(request.headers?.[PEER_HEADER]);
+    if (claimed) {
+      const known = [...peers].find(
+        (peer) => normalizePeerUrl(peer) === claimed,
+      );
+      if (known) {
+        return known;
+      }
+    }
+    const remote = normalizeHost(request.socket?.remoteAddress);
+    const matches = [...peers].filter(
+      (peer) => normalizeHost(hostOfPeer(peer)) === remote,
+    );
+    return matches.length === 1 ? matches[0] : null;
   }
 
   function summarizeAddress(address) {
@@ -937,8 +1081,12 @@ export function startNode(options) {
         // Which process is answering, so a second node on the same machine
         // can be told apart from this one by its explorer or backup panel.
         pid: process.pid,
-        // Null until this node adopts a heavier branch than its own.
-        lastReorg,
+        // The most recent switch, null until this node adopts a heavier branch
+        // than its own. Derived from the history so the notice and the list can
+        // never disagree, including after a restart.
+        lastReorg: reorgHistory[0] ?? null,
+        // Newest first, bounded, and kept on disk next to the chain.
+        reorgHistory,
         explorer: selfUrl,
         announce: announceUrl,
       });

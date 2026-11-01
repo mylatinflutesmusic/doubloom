@@ -391,6 +391,32 @@
         color: var(--muted);
         font-variant-numeric: tabular-nums;
       }
+      /* Recent chain switches: one line per switch, newest first. The branch
+         that lost is the interesting half, so it gets the room and the hash. */
+      .switches { list-style: none; margin: 0; padding: 0; }
+      .switches li {
+        display: flex;
+        align-items: baseline;
+        gap: 10px;
+        padding: 9px 0;
+        border-bottom: 1px solid rgba(44, 34, 19, 0.65);
+        font-size: 13px;
+        min-width: 0;
+      }
+      .switches li:last-child { border-bottom: none; }
+      .switches li.empty { color: var(--muted); }
+      .switch-when { color: var(--muted); white-space: nowrap; width: 70px; }
+      .switch-fork { white-space: nowrap; }
+      .switch-lost {
+        color: var(--muted);
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      .switch-gained { margin-left: auto; white-space: nowrap; }
+      .switch-hash { color: var(--gold-soft); }
+
       .recovery-entry { display: block; }
       .recovery-entry + .recovery-entry { margin-top: 4px; }
 
@@ -736,6 +762,16 @@
             <tr><td colspan="5" class="empty">Connecting to the node…</td></tr>
           </tbody>
         </table>
+      </section>
+
+      <section class="panel" aria-label="Recent chain switches">
+        <div class="panel-head">
+          <h3>Chain switches</h3>
+          <span id="switch-note">none recorded</span>
+        </div>
+        <ul class="switches" id="switches">
+          <li class="empty">No chain switches recorded for this node.</li>
+        </ul>
       </section>
 
       <section class="panel" aria-label="Peer traffic">
@@ -1441,6 +1477,70 @@
         box.hidden = false;
       }
 
+      // Chain switches come from the node's own history file, so the list
+      // outlives both this page and a restart of the node: an overnight reorg is
+      // still there in the morning. Each row names the branch that lost, since
+      // the branch that won is already visible as the chain.
+      function renderSwitches(history) {
+        const list = $("switches");
+        const entries = Array.isArray(history) ? history.slice(0, 10) : [];
+        $("switch-note").textContent =
+          entries.length === 0
+            ? "none recorded"
+            : `${entries.length} kept on disk`;
+        list.replaceChildren();
+        if (entries.length === 0) {
+          const empty = document.createElement("li");
+          empty.className = "empty";
+          empty.textContent = "No chain switches recorded for this node.";
+          list.append(empty);
+          return;
+        }
+        for (const entry of entries) {
+          const lost = entry?.lost ?? {};
+          const lostHeight = Number(lost.height);
+          const lostHash = String(lost.hash ?? "");
+          const gained = String(entry?.gained ?? "");
+          const row = document.createElement("li");
+
+          const when = document.createElement("span");
+          when.className = "switch-when";
+          when.textContent = ageIso(entry.at);
+
+          const fork = document.createElement("span");
+          fork.className = "switch-fork";
+          fork.textContent = `fork #${formatNumber(entry.forkHeight)}`;
+
+          const lostBox = document.createElement("span");
+          lostBox.className = "switch-lost";
+          const lostText = document.createElement("span");
+          lostText.textContent = `replaced #${formatNumber(lostHeight)} `;
+          const lostHashBox = document.createElement("span");
+          lostHashBox.className = "mono switch-hash";
+          lostHashBox.textContent = lostHash ? `${lostHash.slice(0, 10)}…` : "—";
+          lostBox.append(lostText, lostHashBox);
+
+          const gainedBox = document.createElement("span");
+          gainedBox.className = "switch-gained";
+          gainedBox.textContent =
+            gained && gained !== "0" ? `+${formatWork(gained)} work` : "equal work";
+
+          row.append(when, fork, lostBox, gainedBox);
+          row.title = [
+            utcTime(entry.at),
+            entry.peer ? `adopted from ${entry.peer}` : null,
+            `lost tip #${formatNumber(lostHeight)} ${lostHash}`,
+            `lost work total ${formatWork(lost.work)}, ${formatWork(lost.workAboveFork)} of it above the fork`,
+            `new tip #${formatNumber(entry.height)} ${entry.tip}`,
+            `${formatNumber(entry.added)} block(s) adopted, ${formatNumber(entry.dropped)} dropped`,
+            `heavier by ${formatWork(gained)} work`,
+          ]
+            .filter(Boolean)
+            .join(" · ");
+          list.append(row);
+        }
+      }
+
       // The last peer check of the announced address. Nothing inside the node
       // can prove its own address works from outside, so the header reports
       // which peer was asked, whether it got through and how long ago.
@@ -1555,6 +1655,7 @@
           $("network-note").textContent = `${info.network} · best ${String(info.bestBlockHash).slice(0, 16)}…`;
           renderBackup(info, backup);
           renderReorg(info);
+          renderSwitches(info.reorgHistory);
 
           $("blocks").innerHTML = blocks.blocks
             .map(

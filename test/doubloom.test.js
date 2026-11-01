@@ -58,8 +58,15 @@ import {
 } from '../src/keys.js';
 import { hash160, sha256d } from '../src/hash.js';
 import { loadNodeState, nodeStateFile } from '../src/node-state.js';
+import {
+  appendReorg,
+  loadReorgHistory,
+  reorgHistoryFile,
+} from '../src/reorg-history.js';
 import { formatAmount, parseAmount } from '../src/amount.js';
 import { parseSeed, discoverSeedPeers } from '../src/peer-discovery.js';
+import { steadyGaps } from '../bench/growth.js';
+import { formatWork, WORK_FULL_DIGITS } from '../src/work-format.js';
 
 const mainnet = networkParams('mainnet');
 const devnet = networkParams('devnet');
@@ -1022,6 +1029,238 @@ test('a reorg updates the node\'s known blocks without rescanning the chain', as
     console.error = originalError;
     fs.rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test('the chain-switch history is bounded and survives a damaged file', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'doubloom-switches-'));
+  const file = path.join(dir, 'switches.json');
+
+  const entry = (index) => ({
+    at: new Date(Date.UTC(2026, 0, 1, 0, index)).toISOString(),
+    forkHeight: 100 + index,
+    height: 200 + index,
+    tip: `${index}`.repeat(64).slice(0, 64),
+    peer: 'http://127.0.0.1:1',
+    added: index,
+    dropped: index + 1,
+    lost: {
+      height: 150 + index,
+      hash: `f${index}`.repeat(64).slice(0, 64),
+      work: '20',
+      workAboveFork: '5',
+    },
+    gained: '7',
+  });
+
+  try {
+    assert.deepEqual(
+      loadReorgHistory({ file, network: devnet.name }),
+      [],
+      'no file means no history',
+    );
+
+    // Three entries, newest first, on disk after every append.
+    for (const index of [1, 2, 3]) {
+      const history = appendReorg({
+        file,
+        network: devnet.name,
+        entry: entry(index),
+        limit: 3,
+      });
+      assert.equal(history.length, index);
+    }
+    let history = loadReorgHistory({ file, network: devnet.name, limit: 3 });
+    assert.deepEqual(
+      history.map((item) => item.forkHeight),
+      [103, 102, 101],
+      'the newest switch is first',
+    );
+
+    // A fourth switch evicts the oldest: the file stays bounded.
+    history = appendReorg({
+      file,
+      network: devnet.name,
+      entry: entry(4),
+      limit: 3,
+    });
+    assert.deepEqual(
+      history.map((item) => item.forkHeight),
+      [104, 103, 102],
+    );
+    assert.equal(
+      JSON.parse(fs.readFileSync(file, 'utf8')).switches.length,
+      3,
+      'the file itself is bounded, not just the returned list',
+    );
+    assert.ok(
+      !fs.existsSync(`${file}.tmp`),
+      'the write is atomic: no temporary file is left behind',
+    );
+
+    // A file belonging to another network is ignored rather than mixed in.
+    assert.deepEqual(
+      loadReorgHistory({ file, network: mainnet.name }),
+      [],
+    );
+
+    // Damage is tolerated: this is diagnostic detail, not consensus state.
+    fs.writeFileSync(file, '{"version":1,"switches":[nu');
+    assert.deepEqual(loadReorgHistory({ file, network: devnet.name }), []);
+    fs.writeFileSync(
+      file,
+      JSON.stringify({ version: 1, network: devnet.name, switches: [{ at: 1 }] }),
+    );
+    assert.deepEqual(
+      loadReorgHistory({ file, network: devnet.name }),
+      [],
+      'malformed entries are dropped instead of reported',
+    );
+
+    assert.throws(
+      () => appendReorg({ file, network: devnet.name, entry: { at: 'now' } }),
+      /chain switch entry needs/,
+    );
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a reorg is recorded on disk with the branch it replaced', async () => {
+  const { startNode } = await import('../src/node.js');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'doubloom-switch-log-'));
+  const wallet = new Wallet('unused.json', devnet);
+  const miner = wallet.newKey('miner');
+  const peerMiner = wallet.newKey('peer');
+
+  const chainA = Chain.create(devnet);
+  mineBlocks(chainA, miner.address, 20);
+  // B forks from A's block 15 and mines past it, so adopting B replaces the top
+  // of A's chain instead of extending it.
+  const chainB = new Chain(
+    devnet,
+    JSON.parse(JSON.stringify(chainA.blocks.slice(0, 16))),
+  );
+  mineBlocks(chainB, peerMiner.address, 12);
+
+  // Everything the record has to agree with, captured before the node mutates
+  // its chain in place.
+  const lostTipHash = headerHash(chainA.tip.header);
+  const lostHeight = chainA.height;
+  const lostWork = chainA.work;
+  const lostAboveFork = cumulativeWork(chainA.blocks.slice(16));
+  const expectedGain = chainB.work - chainA.work;
+  const chainFile = path.join(dir, 'a.json');
+
+  const logs = [];
+  const originalLog = console.log;
+  console.log = (...args) => logs.push(args.join(' '));
+
+  const listening = async (node) => {
+    const deadline = Date.now() + 3000;
+    while (!node.server.address() && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    return `http://127.0.0.1:${node.server.address().port}`;
+  };
+
+  const nodeB = startNode({
+    chain: chainB,
+    params: devnet,
+    chainFile: path.join(dir, 'b.json'),
+    port: 0,
+  });
+  let nodeA = null;
+  let restarted = null;
+
+  try {
+    const bUrl = await listening(nodeB);
+    nodeA = startNode({
+      chain: chainA,
+      params: devnet,
+      chainFile,
+      port: 0,
+      peers: [bUrl],
+    });
+    const aUrl = await listening(nodeA);
+    const deadline = Date.now() + 8000;
+    while (
+      !logs.some((line) => line.includes('reorg at fork #')) &&
+      Date.now() < deadline
+    ) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+
+    const file = reorgHistoryFile(chainFile);
+    assert.ok(fs.existsSync(file), 'the switch is written beside the chain');
+    const stored = loadReorgHistory({ file, network: devnet.name });
+    assert.equal(stored.length, 1);
+    const entry = stored[0];
+
+    // The branch that lost, not just the one that arrived.
+    assert.equal(entry.forkHeight, 15);
+    assert.equal(entry.lost.height, lostHeight);
+    assert.equal(entry.lost.hash, lostTipHash);
+    assert.equal(BigInt(entry.lost.work), lostWork);
+    assert.equal(
+      BigInt(entry.lost.workAboveFork),
+      lostAboveFork,
+      'the work of the abandoned blocks is what was replaced',
+    );
+    assert.equal(entry.dropped, lostHeight - 15);
+    assert.equal(entry.added, chainB.height - 15);
+    assert.equal(entry.height, chainB.height);
+    assert.equal(entry.tip, headerHash(chainB.tip.header));
+    assert.equal(BigInt(entry.gained), expectedGain);
+    assert.equal(entry.peer, bUrl);
+    assert.ok(Number.isFinite(Date.parse(entry.at)));
+
+    // The API reports the same record, and the notice reads from it.
+    const info = await (await fetch(`${aUrl}/api/info`)).json();
+    assert.deepEqual(info.reorgHistory, stored);
+    assert.deepEqual(info.lastReorg, entry);
+
+    // History is on disk, so a restart does not forget it.
+    await nodeA.close();
+    nodeA = null;
+    restarted = startNode({
+      chain: Chain.create(devnet),
+      params: devnet,
+      chainFile,
+      port: 0,
+    });
+    const restartedUrl = await listening(restarted);
+    const after = await (await fetch(`${restartedUrl}/api/info`)).json();
+    assert.deepEqual(after.reorgHistory, stored, 'a restart keeps the history');
+    assert.deepEqual(after.lastReorg, entry);
+  } finally {
+    if (nodeA) {
+      await nodeA.close();
+    }
+    if (restarted) {
+      await restarted.close();
+    }
+    await nodeB.close();
+    console.log = originalLog;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('the explorer lists recent chain switches from the node', () => {
+  const explorer = fs.readFileSync(
+    new URL('../src/explorer.html', import.meta.url),
+    'utf8',
+  );
+  assert.match(explorer, /<ul class="switches" id="switches">/);
+  assert.match(explorer, /id="switch-note"/);
+  // Fed by the API's history, so the list reflects the node rather than what
+  // this page happened to witness.
+  assert.match(explorer, /renderSwitches\(info\.reorgHistory\)/);
+  assert.match(explorer, /Array\.isArray\(history\) \? history\.slice\(0, 10\)/);
+  // Each row names the branch that lost, its height and its hash.
+  assert.match(explorer, /replaced #\$\{formatNumber\(lostHeight\)\}/);
+  assert.match(explorer, /lostHash\.slice\(0, 10\)/);
+  // And how much heavier the adopted branch was.
+  assert.match(explorer, /\+\$\{formatWork\(gained\)\} work/);
 });
 
 test('difficulty retargets toward the target block time', () => {
