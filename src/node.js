@@ -572,7 +572,11 @@ export function startNode(options) {
     };
   }
 
-  /** Send to every peer and return the ones that accepted the request. */
+  /**
+   * Send to every peer and return the ones that accepted the request. Each
+   * request names this node, so a peer that cannot append a pushed block knows
+   * which peer to ask for the chain instead of asking all of them.
+   */
   async function broadcast(endpoint, payload) {
     const body = JSON.stringify(payload);
     const delivered = await Promise.all(
@@ -580,7 +584,10 @@ export function startNode(options) {
         try {
           await peerFetch(peer, endpoint, {
             method: 'POST',
-            headers: { 'content-type': 'application/json' },
+            headers: {
+              'content-type': 'application/json',
+              [PEER_HEADER]: announceUrl,
+            },
             body,
             signal: AbortSignal.timeout(5000),
           });
@@ -704,9 +711,10 @@ export function startNode(options) {
     return locator;
   }
 
-  async function syncPeers() {
+  async function syncPeers(preferred = null) {
     if (syncing) {
       syncQueued = true;
+      syncQueuedPeer ??= preferred;
       return;
     }
     syncing = true;
@@ -714,8 +722,15 @@ export function startNode(options) {
     let passBlocks = 0;
     let passBytes = 0;
     let passPeers = 0;
+    // The peer that pushed a block this node could not append goes first: it
+    // evidently holds a branch we lack, so its chain usually settles the fork
+    // on its own, and the rest of the peers are only asked if it does not.
+    const order =
+      preferred && peers.has(preferred)
+        ? [preferred, ...[...peers].filter((peer) => peer !== preferred)]
+        : [...peers];
     try {
-      for (const peer of [...peers]) {
+      for (const peer of order) {
         try {
           const locator = buildLocator().join(',');
           const response = await peerFetch(
@@ -833,11 +848,16 @@ export function startNode(options) {
             passBlocks += result.added;
             saveChain(chain, chainFile);
             activeMiner?.abort();
-            console.log(
-              `synced ${result.added} block(s), ${formatBytes(bytes)} from ${peer}${
-                result.reorg ? ' after a reorg' : ''
-              }`,
+            log('blocks',
+              `synced ${result.added} block(s), ${formatBytes(bytes)} from ${peer}${reorgNote}`,
             );
+            reportForkSettled(result);
+            if (peer === preferred) {
+              // The fork that prompted this pass is settled, so there is nothing
+              // to learn from the other peers that the next periodic pass will
+              // not also find.
+              break;
+            }
           }
         } catch {
           // Unreachable or malicious peer: ignore and keep our chain.
@@ -860,7 +880,9 @@ export function startNode(options) {
       syncing = false;
       if (syncQueued && !stopped) {
         syncQueued = false;
-        requestSync();
+        const queuedPeer = syncQueuedPeer;
+        syncQueuedPeer = null;
+        requestSync(250, queuedPeer);
       }
     }
   }
@@ -872,7 +894,12 @@ export function startNode(options) {
    * difference between converging quickly and mining on a doomed tip. Bursts
    * are coalesced into one fetch.
    */
-  function requestSync(delayMs = 250) {
+  function requestSync(delayMs = 250, prefer = null) {
+    if (prefer && peers.has(prefer)) {
+      // Recorded even when a pass is already scheduled: the sender still goes
+      // first when that pass runs.
+      syncPreference ??= prefer;
+    }
     if (stopped || peers.size === 0 || syncRequestTimer) {
       return false;
     }
@@ -886,7 +913,9 @@ export function startNode(options) {
     lastSyncRequestAt = Date.now();
     syncRequestTimer = setTimeout(() => {
       syncRequestTimer = null;
-      syncPeers();
+      const preferred = syncPreference;
+      syncPreference = null;
+      syncPeers(preferred);
     }, wait);
     syncRequestTimer.unref?.();
     return true;
@@ -1588,14 +1617,20 @@ export function startNode(options) {
         size: result.size,
         mempool: chain.mempool.size,
       });
-      console.log(
+      // Size and fee rate as well as the fee: the rate is what decides whether
+      // a transaction would be relayed, so a log line without it cannot explain
+      // why a marginal payment took as long as it did. The rate matches the
+      // mempool's, which divides the same fee by the same byte count.
+      const feeRate = Number(result.fee) / result.size;
+      log(
+        'full',
         `received tx ${result.txid} from ${source} (${
           transaction.inputs.length
         } in, ${transaction.outputs.length} out, ${formatAmount(
           result.fee,
-        )} DBL fee)`,
+        )} DBL fee, ${result.size} bytes, ${feeRate.toFixed(2)} petal/byte)`,
       );
-      relay('/api/tx', transaction, `tx ${result.txid}`);
+      relay('/api/tx', transaction, `tx ${result.txid}`, 'full');
       return;
     }
 
@@ -1607,21 +1642,39 @@ export function startNode(options) {
         result = chain.addBlock(block);
       } catch (error) {
         // A block we have never seen that does not extend our tip means the
-        // sender is on a branch we do not know about. Fetch its chain now
-        // rather than leaving the fork standing until the periodic sync.
-        // Duplicates (a peer echoing one of our blocks back) are known and
-        // must not trigger a fetch, or every relay would cause one.
-        if (!isKnownBlock(block) && requestSync()) {
-          console.log(
-            `block ${headerHash(block.header)} from ${source} does not extend our tip; requesting the peer chain`,
-          );
+        // sender is on a branch we do not know about. Ask that peer for its
+        // chain now rather than leaving the fork standing until the periodic
+        // sync — it is the one that evidently has something we lack. Only when
+        // it cannot be told which peer it was does the fetch fan out to all of
+        // them. Duplicates (a peer echoing one of our blocks back) are known
+        // and must not trigger a fetch, or every relay would cause one.
+        const known = isKnownBlock(block);
+        if (!known) {
+          const sender = senderPeer(request);
+          // The clock starts at the first rejection of an open fork, so the
+          // measurement covers the whole episode rather than the last echo of
+          // it. An older watch belongs to a fork that is already gone.
+          if (!forkWatch || Date.now() - forkWatch.at > FORK_WATCH_MS) {
+            forkWatch = {
+              at: Date.now(),
+              hash: headerHash(block.header),
+              peer: sender ?? source,
+            };
+          }
+          if (requestSync(250, sender)) {
+            log('blocks',
+              sender
+                ? `block ${headerHash(block.header)} from ${source} does not extend our tip; requesting the chain from ${sender}`
+                : `block ${headerHash(block.header)} from ${source} does not extend our tip; requesting the peer chain`,
+            );
+          }
         }
         throw error;
       }
       knownHashes.add(result.hash);
       saveChain(chain, chainFile);
       activeMiner?.abort();
-      console.log(
+      log('blocks',
         `received block ${result.height} ${result.hash} from ${source} (${
           block.transactions.length
         } tx)`,

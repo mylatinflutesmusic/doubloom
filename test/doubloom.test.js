@@ -970,6 +970,11 @@ test('a reorg updates the node\'s known blocks without rescanning the chain', as
   const abandoned = chainA.blocks[20];
   const abandonedHash = headerHash(abandoned.header);
 
+  // Where node A stands before it syncs, captured now because startNode adopts
+  // into the same Chain instance: this is the branch the log must name as lost.
+  const lostTipHash = headerHash(chainA.tip.header);
+  const lostWork = chainA.work;
+
   const logs = [];
   const originalLog = console.log;
   const originalError = console.error;
@@ -1012,14 +1017,23 @@ test('a reorg updates the node\'s known blocks without rescanning the chain', as
     // The startup sync adopts B's heavier branch.
     const deadline = Date.now() + 8000;
     while (
-      !logs.some((line) => line.includes('after a reorg')) &&
+      !logs.some((line) => line.includes('reorg at fork #')) &&
       Date.now() < deadline
     ) {
       await new Promise((resolve) => setTimeout(resolve, 25));
     }
     assert.ok(
-      logs.some((line) => line.includes('after a reorg')),
+      logs.some((line) => line.includes('reorg at fork #')),
       'the fork was adopted',
+    );
+    // The fork in this test is fixed, so the line can be pinned exactly: the
+    // height that was replaced, both short hashes and the work difference.
+    const reorgLine = logs.find((line) => line.includes('reorg at fork #'));
+    assert.ok(
+      reorgLine.includes(
+        `reorg at fork #15: #20 ${lostTipHash.slice(0, 12)}… → #${chainB.height} ${headerHash(chainB.tip.header).slice(0, 12)}…, +${chainB.work - lostWork} work`,
+      ),
+      `the log names both tips and the work gained: ${reorgLine}`,
     );
     const info = await (await fetch(`${aUrl}/api/info`)).json();
     assert.equal(info.height, chainB.height);
@@ -4606,11 +4620,19 @@ test('a node logs the transactions it accepts and relays, but not echoes', async
     assert.equal(accepted.status, 200);
     assert.equal(accepted.body.txid, payment.txid);
 
-    // The accepting node names the sender, the shape and the fee.
+    // The accepting node names the sender, the shape, the fee, the size and the
+    // fee rate, so a line shows what the transaction cost and how efficiently it
+    // bought its space. The rate is the mempool's own figure, not a second
+    // calculation that could drift from the one `doubloom mempool` prints.
+    const mempool = await (await fetch(`${aUrl}/api/mempool`)).json();
+    const entry = mempool.transactions.find((tx) => tx.txid === payment.txid);
+    assert.ok(entry, 'the transaction is in the mempool');
+    assert.equal(entry.size, accepted.body.size);
     const received =
       `received tx ${payment.txid} from 127.0.0.1 ` +
       `(${payment.transaction.inputs.length} in, ${payment.transaction.outputs.length} out, ` +
-      `${accepted.body.fee} DBL fee)`;
+      `${accepted.body.fee} DBL fee, ${accepted.body.size} bytes, ` +
+      `${entry.feeRate.toFixed(2)} petal/byte)`;
     assert.ok(logs.includes(received), `expected log line: ${received}`);
 
     // Relaying is logged only for a peer that took it, and only after it did.
@@ -4652,6 +4674,131 @@ test('a node logs the transactions it accepts and relays, but not echoes', async
     await nodeB.close();
     console.log = originalLog;
     console.error = originalError;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('log level "blocks" keeps block events and drops transaction lines', async () => {
+  const { startNode } = await import('../src/node.js');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'doubloom-log-level-'));
+  const funded = fundedChain();
+  const chain = new Chain(
+    devnet,
+    JSON.parse(JSON.stringify(funded.chain.blocks)),
+  );
+
+  const logs = [];
+  const originalLog = console.log;
+  const originalError = console.error;
+  console.log = (...args) => logs.push(args.join(' '));
+  console.error = (...args) => logs.push(args.join(' '));
+
+  let node = null;
+  const listening = async (instance) => {
+    const deadline = Date.now() + 3000;
+    while (!instance.server.address() && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    return `http://127.0.0.1:${instance.server.address().port}`;
+  };
+
+  try {
+    node = startNode({
+      chain,
+      params: devnet,
+      chainFile: path.join(dir, 'chain.json'),
+      port: 0,
+      logLevel: 'blocks',
+    });
+    const url = await listening(node);
+
+    const payment = funded.wallet.buildTransaction(chain, {
+      to: funded.recipient.address,
+      amount: 5n * COIN,
+      feeRate: 1,
+    });
+    const accepted = await fetch(`${url}/api/tx`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(payment.transaction),
+    });
+    assert.equal(accepted.status, 200);
+
+    const block = chain.buildBlock(funded.miner.address);
+    mineHeader(block.header);
+    const pushed = await fetch(`${url}/api/block`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(block),
+    });
+    assert.equal(pushed.status, 200);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    const txLines = logs.filter(
+      (line) =>
+        line.startsWith('received tx') || line.startsWith('relayed tx'),
+    );
+    assert.deepEqual(
+      txLines,
+      [],
+      `no transaction lines at this level: ${txLines.join(' | ')}`,
+    );
+    // The block events are exactly what must survive.
+    assert.ok(logs.some((line) => line.startsWith('received block')));
+    // Quiet logging is not quiet behaviour: both were still accepted.
+    assert.equal((await (await fetch(`${url}/api/mempool`)).json()).count, 0);
+    assert.equal((await (await fetch(`${url}/api/info`)).json()).height, 102);
+  } finally {
+    if (node) {
+      await node.close();
+    }
+    console.log = originalLog;
+    console.error = originalError;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('an unknown log level is rejected before the node starts', async () => {
+  const { startNode } = await import('../src/node.js');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'doubloom-log-level-bad-'));
+  try {
+    assert.throws(
+      () =>
+        startNode({
+          chain: Chain.create(devnet),
+          params: devnet,
+          chainFile: path.join(dir, 'chain.json'),
+          port: 0,
+          logLevel: 'verbose',
+        }),
+      /unknown log level "verbose"/,
+    );
+    // Nothing was written or bound before the refusal.
+    assert.deepEqual(fs.readdirSync(dir), []);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('doubloom node passes --log-level through to the node', async () => {
+  const cliPath = fileURLToPath(new URL('../src/cli.js', import.meta.url));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'doubloom-log-level-cli-'));
+  const run = (...args) =>
+    promisify(execFile)(
+      process.execPath,
+      [cliPath, '--network', 'devnet', '--datadir', dir, ...args],
+      { timeout: 20_000 },
+    );
+  try {
+    await run('init');
+    await assert.rejects(
+      run('node', '--log-level', 'verbose', '--port', '0'),
+      (error) => {
+        assert.match(error.stderr, /unknown log level "verbose"/);
+        return true;
+      },
+    );
+  } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
@@ -4728,16 +4875,29 @@ test('a pushed block that does not extend the tip triggers an immediate chain fe
 
     assert.equal(height, chainB.height, 'the forked node adopted the heavier chain');
     assert.ok(elapsed < 5000, `converged in ${elapsed}ms without waiting for the 20s sync`);
+    // The push came from the peer's own address, so the node can tell which peer
+    // sent it and names that peer: the fetch is aimed, not a fan-out.
     assert.ok(
       logs.some((line) =>
-        line.includes('does not extend our tip; requesting the peer chain'),
+        line.includes(
+          `does not extend our tip; requesting the chain from ${bUrl}`,
+        ),
       ),
-      'the rejection is logged',
+      'the rejection is logged against the peer that sent the block',
+    );
+    // The wait from that rejection to the switch is reported, so convergence
+    // can be read off the log instead of timed by hand.
+    const settled = logs.find((line) => line.includes('ms after rejecting block'));
+    assert.ok(settled, 'the time to the heavier chain is logged');
+    const settledMs = Number(settled.match(/(\d+) ms after rejecting/)[1]);
+    assert.ok(
+      settledMs <= elapsed,
+      `logged ${settledMs}ms, the test saw the new tip at ${elapsed}ms`,
     );
 
     // A peer echoing a block we already have must not ask for the chain again.
     const before = logs.filter((line) =>
-      line.includes('requesting the peer chain'),
+      line.includes('requesting the chain from'),
     ).length;
     const duplicate = await fetch(`${aUrl}/api/block`, {
       method: 'POST',
@@ -4746,12 +4906,271 @@ test('a pushed block that does not extend the tip triggers an immediate chain fe
     });
     assert.equal(duplicate.status, 400);
     await new Promise((resolve) => setTimeout(resolve, 600));
-    const after = logs.filter((line) => line.includes('requesting the peer chain'))
+    const after = logs.filter((line) => line.includes('requesting the chain from'))
       .length;
     assert.equal(after, before, 'a duplicate block does not trigger a fetch');
   } finally {
     await nodeA.close();
     await nodeB.close();
+    console.log = originalLog;
+    console.error = originalError;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a rejected push asks the peer that sent the block, not every peer', async () => {
+  const { startNode } = await import('../src/node.js');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'doubloom-sender-first-'));
+  const wallet = new Wallet('unused.json', devnet);
+  const minerA = wallet.newKey('a');
+  const minerB = wallet.newKey('b');
+  const minerC = wallet.newKey('c');
+
+  const ancestor = Chain.create(devnet);
+  mineBlocks(ancestor, minerA.address, 110);
+  const fork = () =>
+    new Chain(devnet, JSON.parse(JSON.stringify(ancestor.blocks)));
+  const chainA = fork();
+  const chainB = fork();
+  const chainC = fork();
+  mineBlocks(chainA, minerA.address, 2);
+  // B, the sender, is the heavier branch; C is a peer the pass should never
+  // need once B has answered.
+  mineBlocks(chainB, minerB.address, 6);
+  mineBlocks(chainC, minerC.address, 4);
+
+  const logs = [];
+  const originalLog = console.log;
+  const originalError = console.error;
+  console.log = (...args) => logs.push(args.join(' '));
+  console.error = (...args) => logs.push(args.join(' '));
+
+  const listening = async (node) => {
+    const deadline = Date.now() + 3000;
+    while (!node.server.address() && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    return `http://127.0.0.1:${node.server.address().port}`;
+  };
+  const info = async (url) => (await fetch(`${url}/api/info`)).json();
+  const requestsTo = (snapshot, peer) =>
+    snapshot.peerTraffic.peers.find((entry) => entry.peer === peer)?.requests ??
+    0;
+
+  const nodeB = startNode({
+    chain: chainB,
+    params: devnet,
+    chainFile: path.join(dir, 'b.json'),
+    port: 0,
+    reachabilityDelayMs: 60_000,
+  });
+  const nodeC = startNode({
+    chain: chainC,
+    params: devnet,
+    chainFile: path.join(dir, 'c.json'),
+    port: 0,
+    reachabilityDelayMs: 60_000,
+  });
+  let nodeA = null;
+
+  try {
+    const bUrl = await listening(nodeB);
+    const cUrl = await listening(nodeC);
+    // A starts with no peers: a start-up pass would adopt the heavier chain
+    // before the push had a chance to ask for it.
+    nodeA = startNode({
+      chain: chainA,
+      params: devnet,
+      chainFile: path.join(dir, 'a.json'),
+      port: 0,
+      reachabilityDelayMs: 60_000,
+    });
+    const aUrl = await listening(nodeA);
+    await fetch(`${aUrl}/api/peers`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ peers: [bUrl, cUrl] }),
+    });
+    // Introducing a peer schedules a reachability probe; let it land so the
+    // baselines below do not move under the assertion.
+    await new Promise((resolve) => setTimeout(resolve, 900));
+
+    const before = await info(aUrl);
+    assert.equal(before.height, chainA.height);
+    const bBefore = requestsTo(before, bUrl);
+    const cBefore = requestsTo(before, cUrl);
+
+    // Pushed the way this node's own relays push: naming the sender.
+    const rejected = await fetch(`${aUrl}/api/block`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-doubloom-from': bUrl,
+      },
+      body: JSON.stringify(chainB.tip),
+    });
+    assert.equal(rejected.status, 400);
+
+    let current = before;
+    const deadline = Date.now() + 5000;
+    while (current.height !== chainB.height && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      current = await info(aUrl);
+    }
+    assert.equal(
+      current.height,
+      chainB.height,
+      'the sender chain was adopted without waiting for the periodic sync',
+    );
+    assert.ok(
+      requestsTo(current, bUrl) > bBefore,
+      'the peer that sent the block was asked for its chain',
+    );
+    // Both ends of the measurement are on the log: the rejection, then the
+    // switch it led to, with the peer named in each.
+    const settled = logs.find((line) => line.includes('ms after rejecting block'));
+    assert.ok(settled, 'the time from rejection to the switch is logged');
+    assert.ok(
+      settled.includes(`from ${bUrl}`),
+      `the timing names the peer that sent the block: ${settled}`,
+    );
+    assert.ok(
+      Number(settled.match(/(\d+) ms after rejecting/)[1]) < 5000,
+      'the switch happened promptly rather than on a later pass',
+    );
+    assert.equal(
+      requestsTo(current, cUrl),
+      cBefore,
+      'the other peer was not queried once the sender resolved the fork',
+    );
+    assert.ok(
+      logs.some((line) => line.includes(`requesting the chain from ${bUrl}`)),
+      'the log names the peer the chain was fetched from',
+    );
+  } finally {
+    await nodeA.close();
+    await nodeB.close();
+    await nodeC.close();
+    console.log = originalLog;
+    console.error = originalError;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a rejected push still asks the other peers when the sender has nothing new', async () => {
+  const { startNode } = await import('../src/node.js');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'doubloom-sender-fallback-'));
+  const wallet = new Wallet('unused.json', devnet);
+  const minerA = wallet.newKey('a');
+  const minerB = wallet.newKey('b');
+  const minerC = wallet.newKey('c');
+
+  const ancestor = Chain.create(devnet);
+  mineBlocks(ancestor, minerA.address, 110);
+  const fork = () =>
+    new Chain(devnet, JSON.parse(JSON.stringify(ancestor.blocks)));
+  const chainA = fork();
+  const chainB = fork();
+  const chainC = fork();
+  mineBlocks(chainA, minerA.address, 2);
+  // The sender is behind A and on another branch, so asking it settles
+  // nothing; only the third peer has a chain worth adopting.
+  mineBlocks(chainB, minerB.address, 1);
+  mineBlocks(chainC, minerC.address, 10);
+
+  const logs = [];
+  const originalLog = console.log;
+  const originalError = console.error;
+  console.log = (...args) => logs.push(args.join(' '));
+  console.error = (...args) => logs.push(args.join(' '));
+
+  const listening = async (node) => {
+    const deadline = Date.now() + 3000;
+    while (!node.server.address() && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    return `http://127.0.0.1:${node.server.address().port}`;
+  };
+  const info = async (url) => (await fetch(`${url}/api/info`)).json();
+  const requestsTo = (snapshot, peer) =>
+    snapshot.peerTraffic.peers.find((entry) => entry.peer === peer)?.requests ??
+    0;
+
+  const nodeB = startNode({
+    chain: chainB,
+    params: devnet,
+    chainFile: path.join(dir, 'b.json'),
+    port: 0,
+    reachabilityDelayMs: 60_000,
+  });
+  const nodeC = startNode({
+    chain: chainC,
+    params: devnet,
+    chainFile: path.join(dir, 'c.json'),
+    port: 0,
+    reachabilityDelayMs: 60_000,
+  });
+  let nodeA = null;
+
+  try {
+    const bUrl = await listening(nodeB);
+    const cUrl = await listening(nodeC);
+    nodeA = startNode({
+      chain: chainA,
+      params: devnet,
+      chainFile: path.join(dir, 'a.json'),
+      port: 0,
+      reachabilityDelayMs: 60_000,
+    });
+    const aUrl = await listening(nodeA);
+    await fetch(`${aUrl}/api/peers`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ peers: [bUrl, cUrl] }),
+    });
+    await new Promise((resolve) => setTimeout(resolve, 900));
+
+    const before = await info(aUrl);
+    const bBefore = requestsTo(before, bUrl);
+    const cBefore = requestsTo(before, cUrl);
+
+    const rejected = await fetch(`${aUrl}/api/block`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-doubloom-from': bUrl,
+      },
+      body: JSON.stringify(chainB.tip),
+    });
+    assert.equal(rejected.status, 400);
+
+    let current = before;
+    const deadline = Date.now() + 5000;
+    while (current.height !== chainC.height && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      current = await info(aUrl);
+    }
+    assert.equal(
+      current.height,
+      chainC.height,
+      'the pass went on to a peer that did have a heavier chain',
+    );
+    assert.ok(
+      requestsTo(current, bUrl) > bBefore,
+      'the sender was asked first',
+    );
+    assert.ok(
+      requestsTo(current, cUrl) > cBefore,
+      'the other peer was asked when the sender had nothing to add',
+    );
+    assert.ok(
+      logs.some((line) => line.includes(`requesting the chain from ${bUrl}`)),
+      'the log still names the sender it started with',
+    );
+  } finally {
+    await nodeA.close();
+    await nodeB.close();
+    await nodeC.close();
     console.log = originalLog;
     console.error = originalError;
     fs.rmSync(dir, { recursive: true, force: true });
@@ -4821,17 +5240,19 @@ test('two mining nodes converge on one chain without manual help', async () => {
 
     const deadline = Date.now() + 5000;
     while (
-      !logs.some((line) => line.includes('after a reorg')) &&
+      !logs.some((line) => line.includes('reorg at fork #')) &&
       Date.now() < deadline
     ) {
       await new Promise((resolve) => setTimeout(resolve, 25));
     }
 
-    const reorg = logs.find((line) => line.includes('after a reorg'));
+    const reorg = logs.find((line) => line.includes('reorg at fork #'));
     assert.ok(reorg, 'a node adopted a heavier peer chain on its own');
+    // The line names the switch rather than merely reporting one: fork point,
+    // both tips and how much heavier the adopted branch was.
     assert.match(
       reorg,
-      /^synced \d+ block\(s\), [\d.]+ (B|KiB|MiB) from http:\/\/127\.0\.0\.1:\d+ after a reorg$/,
+      /^synced \d+ block\(s\), [\d.]+ (B|KiB|MiB) from http:\/\/127\.0\.0\.1:\d+ · reorg at fork #\d+: #\d+ [0-9a-f]{12}… → #\d+ [0-9a-f]{12}…, \+\d+ work$/,
     );
 
     // The heavier branch replaced A's own blocks at the fork point.
