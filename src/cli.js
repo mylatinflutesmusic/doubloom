@@ -21,6 +21,7 @@ import {
   retentionAssignments,
 } from './backup-scheduler.js';
 import { loadNodeState, nodeStateFile } from './node-state.js';
+import { formatWork } from './work-format.js';
 
 const GOLD = '\x1b[38;5;214m';
 const DIM = '\x1b[2m';
@@ -1115,7 +1116,9 @@ async function main() {
       row('best block', headerHash(chain.tip.header));
       row('time', timestamp(chain.tip.header.time));
       row('difficulty', chain.difficulty().toLocaleString());
-      row('chain work', chain.work.toLocaleString());
+      // Grouped like the explorer's Chain work card, and shortened past 15
+      // digits the same way, so the two figures can be compared by eye.
+      row('chain work', formatWork(chain.work));
       row('next reward', `${formatAmount(reward)} DBL`);
       row('supply', `${formatAmount(chain.circulatingSupply)} DBL`);
       row('minted', supplyCapPercent(chain.circulatingSupply, ctx.params));

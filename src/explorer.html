@@ -884,16 +884,16 @@
 
       // Cumulative work arrives as a BigInt decimal string: it outgrows a JS
       // number once difficulty rises, and a full 78-digit value would overflow
-      // the card. Keep exact grouped digits while they fit, then shorten to an
-      // exponent with the exact figure in the tooltip.
+      // the card. Grouped digits while they fit, then an exponent form, with the
+      // exact figure in the tooltip. This is a copy of `formatWork` in
+      // src/work-format.js, which `doubloom info` prints the same row with; the
+      // page is served as one self-contained file, so it cannot import it, and a
+      // test evaluates this copy against that one to keep them identical.
       const formatWork = (value) => {
         const text = String(value ?? "");
         if (!/^\d+$/.test(text)) return "—";
-        if (text.length <= 15) {
-          return text.replace(/\B(?=(\d{3})+(?!\d))/g, ",");
-        }
-        const digits = text.slice(0, 4);
-        return `${digits[0]}.${digits.slice(1)}e+${text.length - 1}`;
+        if (text.length <= 15) return BigInt(text).toLocaleString();
+        return `${text[0]}.${text.slice(1, 4)}e+${text.length - 1}`;
       };
 
       // Transfer sizes keep one decimal below 100, so a sync that costs 1.3 MiB

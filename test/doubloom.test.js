@@ -5478,6 +5478,87 @@ test('a peer registered through the API triggers a reachability check', async ()
   }
 });
 
+test('chain work is grouped until it is too long, then shortened', () => {
+  // Grouped for the operator's locale: the expectation is built the same way,
+  // so the test does not assume a separator.
+  assert.equal(formatWork(0n), (0n).toLocaleString());
+  assert.equal(formatWork(42n), (42n).toLocaleString());
+  assert.equal(formatWork(1234), (1234n).toLocaleString());
+  assert.equal(
+    formatWork('9'.repeat(WORK_FULL_DIGITS)),
+    BigInt('9'.repeat(WORK_FULL_DIGITS)).toLocaleString(),
+    'the longest total that stays in full is still grouped',
+  );
+
+  // One digit more, and it becomes a magnitude: four significant digits, the
+  // exact value kept by the JSON output and the card's tooltip instead.
+  assert.equal(formatWork('1' + '0'.repeat(WORK_FULL_DIGITS)), '1.000e+15');
+  assert.equal(formatWork('1234567890123456'), '1.234e+15');
+  assert.equal(formatWork('9'.repeat(78)), '9.999e+77');
+  assert.ok(
+    !formatWork('1234567890123456').includes(','),
+    'the shortened form is a magnitude, not a localized number',
+  );
+
+  // Anything that is not a decimal total is unknown, not zero.
+  for (const value of ['', 'abc', '12a', '-1', ' 12', '1.5', null, undefined]) {
+    assert.equal(formatWork(value), '—', `work ${JSON.stringify(value)}`);
+  }
+});
+
+test('the explorer formats chain work exactly as the CLI does', () => {
+  const explorer = fs.readFileSync(
+    new URL('../src/explorer.html', import.meta.url),
+    'utf8',
+  );
+  const start = explorer.indexOf('const formatWork =');
+  assert.ok(start > 0, 'the explorer has a formatWork helper');
+  const end = explorer.indexOf('\n      };', start);
+  assert.ok(end > start, 'the helper is closed');
+  // The page is served as one self-contained file, so it carries a copy rather
+  // than importing the module: evaluate that copy and compare every case.
+  const browserFormatWork = new Function(
+    `${explorer.slice(start, end + '\n      };'.length)}\nreturn formatWork;`,
+  )();
+
+  const values = [
+    '0',
+    '1',
+    '42',
+    '999',
+    '1000',
+    '9'.repeat(14),
+    '9'.repeat(WORK_FULL_DIGITS),
+    '1' + '0'.repeat(WORK_FULL_DIGITS),
+    '1234567890123456',
+    '9'.repeat(40),
+    '9'.repeat(78),
+    '000042',
+    '',
+    'abc',
+    null,
+    undefined,
+    42,
+    123456789n,
+  ];
+  for (const value of values) {
+    assert.equal(
+      browserFormatWork(value),
+      formatWork(value),
+      `the explorer and CLI differ for ${JSON.stringify(String(value))}`,
+    );
+  }
+});
+
+test('doubloom info prints chain work with the shared formatter', async () => {
+  const cli = fs.readFileSync(new URL('../src/cli.js', import.meta.url), 'utf8');
+  assert.match(
+    cli,
+    /row\('chain work', formatWork\(chain\.work\)\)/,
+    'the text row goes through the formatter the explorer copy matches',
+  );
+});
+
 test('doubloom info reports chain work in text and JSON', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'doubloom-cli-info-'));
   const cliPath = fileURLToPath(new URL('../src/cli.js', import.meta.url));
@@ -5501,7 +5582,7 @@ test('doubloom info reports chain work in text and JSON', async () => {
     assert.match(
       text,
       new RegExp(
-        `difficulty\\s+[\\d.]+\\n\\s+chain work\\s+${chain.work.toLocaleString()}\\n`,
+        `difficulty\\s+[\\d.]+\\n\\s+chain work\\s+${formatWork(chain.work)}\\n`,
       ),
     );
 
