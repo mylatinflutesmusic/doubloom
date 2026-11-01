@@ -34,7 +34,7 @@ import {
   txid,
   validateTransaction,
 } from '../src/transaction.js';
-import { Wallet } from '../src/wallet.js';
+import { Wallet, backupArchiveTime } from '../src/wallet.js';
 import { saveChain, loadChain } from '../src/store.js';
 import { createNodeBackup, restoreNodeBackup } from '../src/backup.js';
 import { createBackupWorker } from '../src/backup-thread.js';
@@ -1607,6 +1607,30 @@ test('an encrypted backup round-trips and refuses unsafe overwrites', () => {
   assert.equal(JSON.parse(backupText).version, 2);
   assert.ok(!backupText.includes(originalPrivateKey), 'backup has no plaintext key');
 
+  // The export stamps itself in gzip's MTIME field, so `wallet restore` can say
+  // which export it installed and the stamp survives a copy that resets times.
+  assert.equal(backupArchiveTime(result.path), result.at, 'read back what was returned');
+  assert.ok(
+    Math.abs(Date.parse(result.at) - Date.now()) < 60_000,
+    'the stamp is the moment the export was written',
+  );
+  const archiveStamp = result.at;
+  fs.utimesSync(result.path, new Date(2020, 0, 1), new Date(2020, 0, 1));
+  assert.equal(
+    backupArchiveTime(result.path),
+    archiveStamp,
+    'a copied archive keeps its own stamp rather than the file time',
+  );
+
+  // An archive from before the stamp was recorded carries zero there; it falls
+  // back to the file's modification time instead of claiming 1970.
+  const unstamped = path.join(dir, 'unstamped.gz');
+  const zeroed = Buffer.from(stored);
+  zeroed.writeUInt32LE(0, 4);
+  fs.writeFileSync(unstamped, zeroed);
+  fs.utimesSync(unstamped, new Date(2020, 0, 1), new Date(2020, 0, 1));
+  assert.equal(backupArchiveTime(unstamped), new Date(2020, 0, 1).toISOString());
+
   // An explicit .gz destination is used as given, not doubled.
   const explicit = wallet.backup(path.join(dir, 'explicit.gz'), passphrase);
   assert.equal(explicit.path, path.join(dir, 'explicit.gz'));
@@ -1681,6 +1705,175 @@ test('an encrypted backup round-trips and refuses unsafe overwrites', () => {
 
   fs.rmSync(dir, { recursive: true, force: true });
   fs.rmSync(plain.dir, { recursive: true, force: true });
+});
+
+test('wallet restore names the export it installed', async () => {
+  const passphrase = 'restore names the export';
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'doubloom-restore-'));
+  const sourceDir = path.join(root, 'source', 'devnet');
+  fs.mkdirSync(sourceDir, { recursive: true });
+  const wallet = Wallet.create(
+    path.join(sourceDir, 'wallet.json'),
+    devnet,
+    'cold storage',
+  );
+  wallet.newKey('treasury');
+  wallet.encrypt(passphrase);
+  const archive = wallet.backup(path.join(root, 'cold'), passphrase);
+
+  // As if the export had been copied around before use: the file time is years
+  // off, so only the archive's own stamp can identify it.
+  fs.utimesSync(archive.path, new Date(2020, 0, 1), new Date(2020, 0, 1));
+
+  const cliPath = fileURLToPath(new URL('../src/cli.js', import.meta.url));
+  try {
+    const { stdout } = await promisify(execFile)(
+      process.execPath,
+      [
+        cliPath,
+        '--network',
+        'devnet',
+        '--datadir',
+        path.join(root, 'restored'),
+        'wallet',
+        'restore',
+        archive.path,
+      ],
+      { timeout: 30_000, env: { ...process.env, DOUBLOOM_PASSPHRASE: passphrase } },
+    );
+    const text = stdout.replace(/\x1b\[[0-9;]*m/g, '');
+
+    // The stamp printed is the export's own, in the same `YYYY-MM-DD HH:MM:SS
+    // UTC` form every other timestamp uses, not the install time.
+    const stamp = `${new Date(archive.at).toISOString().slice(0, 19).replace('T', ' ')} UTC`;
+    assert.match(
+      text,
+      new RegExp(`backup time\\s+${stamp.replace(/[-:]/g, '\\$&')}`),
+      `the export the restore installed is named (${stamp})`,
+    );
+    // The age is read at run time, so a restore in the same second says "just
+    // now" rather than inventing a second.
+    assert.match(
+      text,
+      /\((?:just now|\d+s ago)\)/,
+      'with how long ago it was made',
+    );
+
+    // The labels travel in the archive, so they identify whose keys came back.
+    assert.match(text, /cold storage/);
+    assert.match(text, /treasury/);
+    assert.ok(fs.existsSync(path.join(root, 'restored', 'devnet', 'wallet.json')));
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+/** CRC-32 as gzip's trailer wants it; zlib exposes none on Node 18. */
+function gzipCrc32(buffer) {
+  let crc = 0xffffffff;
+  for (const byte of buffer) {
+    crc ^= byte;
+    for (let bit = 0; bit < 8; bit += 1) {
+      crc = crc & 1 ? (crc >>> 1) ^ 0xedb88320 : crc >>> 1;
+    }
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+/**
+ * Build a wallet backup from the documented bytes alone, so the reader is
+ * checked against the format rather than against whatever the writer emits
+ * today. Any change to the container has to keep this restorable.
+ */
+function handBuiltWalletBackup(walletBytes, mtimeSeconds) {
+  const header = Buffer.alloc(10);
+  header[0] = 0x1f; // gzip magic
+  header[1] = 0x8b;
+  header[2] = 0x08; // deflate
+  header[3] = 0x00; // no optional header fields
+  header.writeUInt32LE(mtimeSeconds, 4);
+  header[8] = 0x00; // XFL
+  header[9] = 0x03; // OS: Unix, and never read back
+
+  const body = zlib.deflateRawSync(walletBytes);
+  const trailer = Buffer.alloc(8);
+  trailer.writeUInt32LE(gzipCrc32(walletBytes), 0);
+  trailer.writeUInt32LE(walletBytes.length >>> 0, 4);
+  return Buffer.concat([header, body, trailer]);
+}
+
+test('wallet backups match the documented container format', () => {
+  const passphrase = 'documented format passphrase';
+  const { dir, file, wallet } = temporaryWallet();
+  wallet.newKey('treasury');
+  wallet.encrypt(passphrase);
+
+  try {
+    const result = wallet.backup(path.join(dir, 'export'), passphrase);
+    const bytes = fs.readFileSync(result.path);
+    const walletBytes = fs.readFileSync(file);
+
+    // The header is exactly what the README documents: gzip, deflate, no
+    // optional fields, and an MTIME that is not zlib's zero.
+    assert.equal(bytes[0], 0x1f, 'gzip magic');
+    assert.equal(bytes[1], 0x8b, 'gzip magic');
+    assert.equal(bytes[2], 0x08, 'deflate');
+    assert.equal(bytes[3], 0x00, 'no optional header fields');
+    assert.equal(
+      bytes.readUInt32LE(4),
+      Math.floor(Date.parse(result.at) / 1000),
+      'MTIME holds the export time to the second',
+    );
+    assert.notEqual(bytes.readUInt32LE(4), 0, 'MTIME is set, not left at zero');
+
+    // The payload is the wallet file byte for byte: version 2, encrypted keys,
+    // no wrapper object around it and no plaintext.
+    const payload = zlib.gunzipSync(bytes);
+    assert.deepEqual(payload, walletBytes);
+    const text = payload.toString('utf8');
+    assert.equal(JSON.parse(text).version, 2);
+    assert.ok(text.includes('"encryptedPrivateKey"'), 'keys stay encrypted');
+    assert.ok(!text.includes('"privateKey":'), 'no plaintext key in the payload');
+
+    // An archive assembled from the documented bytes restores, so old exports
+    // keep working regardless of what the writer does later.
+    const handBuilt = path.join(dir, 'hand-built.gz');
+    const stamp = '2025-06-01T12:00:00.000Z';
+    fs.writeFileSync(
+      handBuilt,
+      handBuiltWalletBackup(walletBytes, Math.floor(Date.parse(stamp) / 1000)),
+    );
+    assert.equal(backupArchiveTime(handBuilt), stamp, 'the documented MTIME reads back');
+    const restored = Wallet.restore(
+      handBuilt,
+      path.join(dir, 'hand-built-restore', 'wallet.json'),
+      devnet,
+      passphrase,
+    );
+    assert.equal(restored.listKeys().length, 2);
+    assert.equal(restored.defaultKey().label, 'primary');
+    assert.equal(restored.isEncrypted, true);
+
+    // The trailer is part of the contract too: a corrupted body must fail rather
+    // than install a wallet that only looks restored. gzip's CRC-32 is what
+    // catches it (zlib reports "incorrect data check"), so a future format that
+    // dropped the checksum would show up here.
+    const corrupt = Buffer.from(bytes);
+    corrupt[corrupt.length - 12] ^= 0xff;
+    const corruptPath = path.join(dir, 'corrupt.gz');
+    const corruptTarget = path.join(dir, 'corrupt-restore', 'wallet.json');
+    fs.writeFileSync(corruptPath, corrupt);
+    assert.throws(
+      () => Wallet.restore(corruptPath, corruptTarget, devnet, passphrase),
+      (error) =>
+        error.code === 'Z_DATA_ERROR' ||
+        /incorrect data check|invalid|unexpected/i.test(error.message),
+      'a corrupted archive is refused by the checksum',
+    );
+    assert.equal(fs.existsSync(corruptTarget), false, 'nothing installed');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test('a node backup restores the chain and encrypted wallet together', () => {

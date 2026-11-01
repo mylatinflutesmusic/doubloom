@@ -147,7 +147,7 @@ chain still hashes most of it, which is inherent in replacing it.
 
 A pushed block that does not extend the tip is not simply rejected: if the
 block is one the node has never seen, the sender is evidently on a branch the
-node does not know, so it fetches its peers' chains at once (about 250 ms)
+node does not know, so it fetches that peer's chain at once (about 250 ms)
 instead of leaving the fork standing until the next 20-second pass. Repeats are
 spaced at least five seconds apart, because two nodes that mine at the same
 time reject each other's blocks continuously and each fetch downloads a whole
@@ -162,7 +162,7 @@ its own log rather than only in the miner's:
 mined block 147 00001c2afed1fca42c5d2008af0ad61a373a042401130c4ee5054f4ee17d04e6 (1 tx, reward 50 DBL)
 relayed block 147 to 1 peer
 received block 147 00001c2afed1fca42c5d2008af0ad61a373a042401130c4ee5054f4ee17d04e6 from 127.0.0.1 (1 tx)
-received tx 9b7f0c2e5a1d4f3b8e6c0a2d4f6b8e0c2a4d6f8b0e2c4a6d8f0b2e4c6a8d0f2b from 127.0.0.1 (1 in, 1 out, 0.0001 DBL fee)
+received tx 9b7f0c2e5a1d4f3b8e6c0a2d4f6b8e0c2a4d6f8b0e2c4a6d8f0b2e4c6a8d0f2b from 127.0.0.1 (1 in, 2 out, 0.00000619 DBL fee, 614 bytes, 1.01 petal/byte)
 relayed tx 9b7f0c2e5a1d4f3b8e6c0a2d4f6b8e0c2a4d6f8b0e2c4a6d8f0b2e4c6a8d0f2b to 1 peer
 synced 70 block(s), 148.6 KiB from http://127.0.0.1:18430
 ```
@@ -173,6 +173,21 @@ facts: an up-to-date peer answering a locator transfers a hundred bytes or so
 and logs nothing, a peer ten blocks ahead transfers a few kilobytes, and a peer
 too old to understand `locator` transfers its whole chain — the same `synced 3
 block(s)` can read `4.1 KiB` or `180.0 KiB` depending on which peer answered.
+
+A sync that replaces the node's branch is named on that same line, rather than
+reported as "after a reorg" with nothing else to go on:
+
+```
+synced 12 block(s), 5.2 KiB from http://127.0.0.1:18991 · reorg at fork #15: #20 084b94da6a70… → #27 46c12eb40628…, +14 work
+```
+
+The left of the arrow is the branch the node was on — the height it reached and
+its tip hash — and the right is the one it adopted, so `#20 … → #27 …` reads as
+"gave up our block 20 for their block 27". `reorg at fork #15` is the last block
+both branches share, and `+14 work` is the difference in cumulative work, which
+is what decided the switch: not the height, but the work. The three numbers are
+the same ones the switch record keeps (below), so the log line and
+`switches.json` cannot describe the same switch differently.
 
 The first pass after start-up, the one that decides what the node is missing,
 also ends with a single summary line totalling every peer, so the result does
@@ -215,9 +230,8 @@ The explorer's **Peers** panel renders the same figures with a `4.2 KiB in ·
 65 B out` headline and one row per peer, keeping a peer that has left the set so
 its cost stays visible. Totals are body bytes only: request headers and the
 status line are not counted, and neither is traffic another node pushes at this
-one, since an inbound POST carries no peer identity beyond a source IP. A GET
-sync therefore shows `sent` staying at whatever the announcements cost while
-`received` grows with the chain.
+one. A GET sync therefore shows `sent` staying at whatever the announcements
+cost while `received` grows with the chain.
 
 `received` is logged only for blocks that actually connect to the tip; a
 block that is invalid or already known is rejected with HTTP 400 and not
@@ -225,17 +239,68 @@ logged, because peers re-broadcast blocks they receive and those duplicates
 would otherwise flood the log. `relayed` reports how many peers accepted the
 POST, and is omitted when there are none. Transactions follow the same
 accepted-only rule: a node logs `received tx` with the sender's address, the
-input and output counts and the fee once the transaction is in its mempool, and
-`relayed tx` only for the peers that actually took it. A duplicate (already in
+input and output counts, the fee, the transaction's size and its fee rate once
+the transaction is in its mempool, and `relayed tx` only for the peers that
+actually took it. The rate comes from the same division of fee by bytes that the
+mempool reports, so the line and `doubloom mempool` cannot disagree about what a
+transaction paid per byte. A duplicate (already in
 the mempool), a conflicting spend or an invalid signature is rejected with HTTP
 400 and logged nowhere, so the relay echo between two nodes that both hold a
 transaction does not double the log. The txid is printed in full, so the two
 lines and the peer's own `received tx` line can be matched by eye. A rejected
-block that is new to the node gets its own line before the fetch it triggers:
+block that is new to the node gets its own line before the fetch it triggers,
+naming the peer it is fetched from:
 
 ```
-block 0000bae11191fd5de2a3cd2c5cad2a8e4e320b2c0d03d7d4eaa23fb11ea82569 from 127.0.0.1 does not extend our tip; requesting the peer chain
+block 0000bae11191fd5de2a3cd2c5cad2a8e4e320b2c0d03d7d4eaa23fb11ea82569 from 127.0.0.1 does not extend our tip; requesting the chain from http://127.0.0.1:18338
 ```
+
+That peer is asked first, and alone if it settles the fork: a block that cannot
+be appended came from a node that evidently holds a branch this one lacks, so
+its chain is the cheapest place to look, and asking the other peers once it has
+answered is work that finds nothing the next pass would not. Only if that chain
+adds no blocks does the pass carry on to the rest, so a sender that is itself
+behind cannot leave the node stuck on a fork. The sender is identified by the
+`x-doubloom-from` header this node's own relays carry, falling back to the
+source address when exactly one known peer lives there — a node too old to send
+the header, or a push from `curl`, logs `requesting the peer chain` and the pass
+fans out as before. Only a peer already in the peer set is trusted: the header
+arrives over plain HTTP, so it cannot point the node at a URL of the sender's
+choosing.
+
+The switch that follows is timed, so the cost of a fork is a number in the log
+rather than something to work out from timestamps:
+
+```
+adopted the heavier chain 319 ms after rejecting block 000ffabae20f… from http://127.0.0.1:51371
+```
+
+The clock starts at the first rejected push of an open fork and stops when that
+branch has replaced the node's own — the 250 ms debounce before the fetch is
+part of the measurement, because it is part of the wait an operator sees. Only a
+reorg counts: a chain that merely extends the tip does not settle a fork. The
+watch expires after a minute, so a switch much later is not charged to a
+rejection that had nothing to do with it.
+
+### Turning transaction lines down
+
+A busy mempool writes two lines per transaction — one where the node accepts it,
+one for each peer it is relayed to — while block and chain events stay
+comparatively rare. `--log-level` decides how much of that a node writes:
+
+| Level | Writes |
+| --- | --- |
+| `full` (default) | everything: blocks, syncs, announcements, backups and transactions |
+| `blocks` | the same, minus `received tx` and `relayed tx` |
+| `quiet` | only warnings and errors |
+
+The setting is per node and applies from start-up. Block events are never
+sacrificed for this: `mined block`, `received block`, `relayed block`, `synced`,
+the chain-switch record and the fork timing all survive `blocks`. Warnings and
+errors bypass the level entirely, so a quiet node still reports a failed backup
+or an announced address that cannot be reached. Use `blocks` for a node whose
+log is being read for chain activity rather than payment activity, and `quiet`
+when the node's health is watched through `/api/info` and the explorer instead.
 
 ### Announcing a reachable address
 
@@ -577,7 +642,7 @@ stays parseable when the node is down. Only `status` takes the flag; `pause` and
 | `tx <txid>` | Inspect a transaction and its fee |
 | `validate` | Replay and validate the entire chain |
 | `backup <file>` | Back up the chain and encrypted wallet in one archive |
-| `backup now` | Ask a running node to write and verify a backup immediately |
+| `backup now [--to <path>]` | Ask a running node to write and verify a backup immediately, optionally as an export to `path` |
 | `backup list` | List archives with their size and the retention tier keeping each |
 | `backup status [--json]` | Show the schedule, recovery history, next run, last archive and error |
 | `restore <file>` | Restore the chain and wallet from a node backup |
@@ -592,11 +657,12 @@ stays parseable when the node is down. Only `status` takes the flag; `pause` and
 
 Useful options: `--network mainnet|devnet`, `--datadir <path>`, `--address`,
 `--from`, `--fee-rate`, `--port`, `--host`, `--announce`, `--peers`, `--seed`,
-`--no-seed`, `--mine`,
+`--no-seed`, `--mine`, `--log-level`,
 `--backup-dir`, `--backup-first-delay`, `--backup-first-max-wait`,
 `--backup-interval`, `--backup-keep-hourly`, `--backup-keep-daily`,
-`--backup-keep-weekly`, `--backup-max-age`, `--backup-recovery-history`,
-`--watch`, `--force`, `--json`.
+`--backup-keep-weekly`, `--backup-max-age`, `--backup-max-lag`,
+`--backup-recovery-history`, `--backup-verify-interval`, `--watch`, `--force`,
+`--json`.
 
 `doubloom info --json` prints the same core fields as `/api/info` plus
 `explorer`, `announce`, a `node` object (`running`, `pid`, `port`,
@@ -609,7 +675,10 @@ decimal DBL strings.
 
 Chain work is reported the same way in both modes, right after difficulty: a
 `chain work` row with the total grouped for the operator's locale, and `work` in
-the JSON as an exact decimal string. It is the cumulative proof-of-work since
+the JSON as an exact decimal string. Past fifteen digits the row is shortened
+instead (`1.234e+15`) — the same rule, and the same cut-off, the explorer's Chain
+work card uses — so a terminal and a browser show the same string for the same
+chain. It is the cumulative proof-of-work since
 genesis — the figure a node compares to decide which branch wins, and the one
 the explorer shows as its Chain work card — so `doubloom info` can be checked
 against `/api/info` and the explorer without summing headers by hand. The node
@@ -636,34 +705,54 @@ you need otherwise. The explorer includes an automatic-backup panel showing
 health, the last backup time, the archived height relative to the tip and the
 archive's compressed size, the schedule, the latest recovery and the earlier
 retained recoveries, plus the archive path, refreshed with the rest of the page.
-The size shares the height row (`#122 · 21 blocks behind tip · 1.4 KB · saved 69%`)
-and carries the exact byte count in its tooltip (`1,731 bytes gzipped (from
-5,669, 69% smaller)`), so the numbers that describe the copy — how much history
-it holds, how big it is and what gzip saved — read together. The saving needs
-the uncompressed size, which the node records with each archive; a status file
+The size shares the height row, and both figures are named: what the file costs
+to keep and what it holds (`#122 · 21 blocks behind tip · 1.4 KB gz · 5.4 KB raw
+· saved 74%`), so the numbers that describe the copy — how much history it holds,
+how big it is and what gzip saved — read together. Its tooltip carries the exact
+byte counts and the key count the node recorded with the archive
+(`1,731 bytes gzipped (from 5,669, 74% smaller) · 2 keys`). Both figures need the
+uncompressed size, which the node records with each archive; a status file
 written before that field existed, or an archive whose compressed size already
-equals its raw size, simply omits the `saved` part. A countdown
+equals its raw size, simply omits the raw figure and the `saved` part, and a file
+with no key count shows none. A countdown
 built from the node’s `nextRunAt` ticks every second until the next scheduled
-run, with the configured first-backup delay shown beside it and repeated in the
-Schedule row so it remains visible without a next run. While the first backup is
-held back by peer sync the countdown is replaced by how long it has been waiting
-(`waiting for sync 25.5s`), and the note under the panel says the first backup
+run, phrased the way `doubloom info` and `doubloom backup status` phrase the same
+run — the clock time first, the countdown in parentheses after it, then the
+configured first-backup delay and the sync wait cap:
+`2026-10-31 23:56:00 UTC (in 9m 50s) · first delay 10 min · sync wait cap 5 min`.
+The delay is repeated in the Schedule row so it remains visible without a next
+run. While the first backup is
+held back by peer sync the parenthesised part becomes how long it has been
+waiting (`(waiting for sync 25.5s)`), which is all the terminal shows without the
+duration, and the note under the panel says the first backup
 runs once the initial sync settles. That figure comes from the node as
 `syncWaitedMs` (with `syncWaitStartedAt` alongside it in `/api/backup`), and the
 page advances it locally each second, so it moves smoothly between the
 five-second refreshes without relying on the browser's clock agreeing with the
 node's. It disappears as soon as the wait ends rather than climbing on stale data. A small ring draws the
-same countdown as a fraction: it fills as the wait elapses — against the first
-backup delay before the first archive, against the interval afterwards — and
-names the percentage, with the span it measures, in its tooltip. The ring is
-hidden while the first backup is still waiting for the initial peer sync,
-since there is no meaningful fraction to show yet. If automatic backups are
+progress through the current wait, and the fraction is the node's own
+`elapsedFraction` rather than something the page works out: the schedule
+measures it from when the cycle actually began — which a watchdog re-arm or a
+restored next run can place well before the page loaded, and which is why only
+the remainder is left on the timer — so a recovered schedule does not restart the
+ring part-way through. `cycleMs` rides along as the length of the wait being
+measured, and the tooltip names the percentage with that span
+(`24% of the 1.5 min wait elapsed`). Between the five-second refreshes the page
+adds only the time since that figure arrived, so the ring moves every second
+without the browser's clock ever deciding where in an interval it is. The ring
+is hidden while the first backup is still waiting for the initial peer sync,
+while a run is in flight, and whenever the node reports no fraction, since there
+is no meaningful progress to show then. If automatic backups are
 enabled but no next run is scheduled for a minute, the panel is marked
 unhealthy and suggests restarting the node. Its "Back up now" button calls
 `POST /api/backup`, which starts the run and answers `202` with a job id; the
 button then polls `GET /api/backup/jobs/:id` once a second, counting the seconds
-while the archive is written and verified and reporting the resulting height or
-error. Nothing is held open for the length of a verification, so the rest of the
+and showing the `progress.percent` the node reports while the archive is written
+and verified, then the resulting height or error. While a run is in flight a
+**Cancel** button appears beside it and sends `DELETE /api/backup/jobs/:id`; the
+answer comes back only once the archive has been removed, and the panel then
+reads `Backup cancelled · discarded <path>` — or `Backup cancelled · no archive
+was written` when the run was stopped before anything reached disk. Nothing is held open for the length of a verification, so the rest of the
 page keeps updating meanwhile, and a reload does not lose the run: `GET
 /api/backup` includes the newest `job` so the page can resume following it, and
 a second request while one is in flight answers `409` with that same job rather
@@ -674,7 +763,28 @@ tip and key count, and the next scheduled run. That command resolves the port
 from `node.json` when `--port` is omitted, so a node started on a custom port is
 still found; a node without `--backup-dir` answers `409` and the CLI says to
 restart it with one, and an address with nothing listening is reported as such
-instead of as an HTTP error. Below the buttons, **Retained archives** lists every
+instead of as an HTTP error. While the node works, the command reports elapsed
+time and how far it has got — one line rewritten in place on a terminal, one
+line every five seconds when the output is piped — so a large archive does not
+look like a hang:
+
+```
+waiting for the node · 42% verified (420/1,000 blocks) · 8s
+```
+
+The percentage is measured work, not an estimate: the node counts the blocks it
+has serialized into the archive (the first half of the bar) and then the blocks
+re-verified while reading it back (the second half). The gap between them is the
+gzip and the file write, which have no block to count. A node that does not
+report progress leaves the line as `waiting for the node to write and verify the
+archive · 8s`. With `--to <path>` that command writes an export
+instead of a retention entry: the archive lands at the path given (with `.gz`
+added if it is missing), verified the same way, but the schedule's last backup,
+its pruning and the retained list are left alone, because they describe the
+directory the node manages. The path is resolved from the shell's directory and
+sent as an absolute one, and it must be outside `--backup-dir` — a file inside
+retention would be invisible to pruning yet never removed, so the node refuses
+it with both paths in the message. Below the buttons, **Retained archives** lists every
 archive retention has kept, newest first, each a download link labelled with its
 UTC time and compressed size and carrying the file name, exact byte count and
 timestamp in its tooltip; the newest is marked so the list also answers "which
@@ -733,24 +843,74 @@ that sum costs about 86 ms per call.
 The explorer shows it as the Chain work card, which is the quick way to spot a
 reorg without reading logs: when a node adopts a heavier peer chain, the tip and
 the work figure both jump to the other branch's values, and a node that ignored
-an equal-or-lighter chain keeps its own. Work below 15 digits is grouped with
-commas; larger values are shortened to an exponent form with the exact figure in
-the tooltip.
+an equal-or-lighter chain keeps its own. Work is grouped for the visitor's locale
+up to fifteen digits; a longer total is shortened to four significant digits and
+an exponent (`1.234e+15`), with the exact figure in the tooltip and the ungrouped
+decimal in `/api/info`'s `work`. That is the same rule `doubloom info` prints, to
+the digit where it switches: the page is served as one self-contained file and
+cannot import the module the CLI uses, so it carries a copy of the formatter, and
+a test evaluates that copy against the module either side of the boundary.
 
 When a node does adopt a heavier branch, the explorer says so: a strip under the
 header reads `Chain switch · fork at #N · new tip #M <hash>… · Ns ago`, with the
 number of blocks adopted, the peer and the full tip in its tooltip. It is driven
-by `/api/info`'s `lastReorg` (`at`, `forkHeight`, `height`, `tip`, `added`,
-`peer`), which stays `null` until the node first replaces its own branch, so a
-node that is simply extending shows nothing. The strip disappears ten minutes
-after the switch, and it is in-memory only: restarting the node clears it.
+by `/api/info`'s `lastReorg`, which stays `null` until the node first replaces
+its own branch, so a node that is simply extending shows nothing. The strip
+disappears ten minutes after the switch — but the switch itself is kept, below.
+
+### Recent chain switches
+
+Each switch is appended to `<datadir>/<network>/switches.json`, newest first and
+bounded to ten entries, so an overnight reorg is still visible in the morning
+after the node has restarted and the strip has timed out. Every record keeps the
+branch that lost as well as the one that won:
+
+```json
+{
+  "at": "2026-10-31T08:04:48.224Z",
+  "forkHeight": 15,
+  "height": 27,
+  "tip": "46c12eb4062842fad26f23e849592dcd3e8927eabbabe1b850b9dcef631d9361",
+  "peer": "http://127.0.0.1:18991",
+  "added": 12,
+  "dropped": 5,
+  "lost": {
+    "height": 20,
+    "hash": "084b94da6a70012503bb225bbd4192f2291485b008c994b591282e5d898c1b56",
+    "work": "42",
+    "workAboveFork": "10"
+  },
+  "gained": "14"
+}
+```
+
+`lost` is where this node stood before it switched — its tip height and hash, the
+cumulative work that branch had, and how much of that work sat above the fork,
+which is the work actually replaced. `gained` is how much heavier the adopted
+branch was, as exact decimal work (work outgrows a JavaScript number, so it is
+stored as a string). `dropped` counts the blocks that left the chain and `added`
+the ones that arrived; for the record above, five blocks were replaced above
+block 15 and twelve took their place.
+
+The explorer lists the same file in a **Chain switches** panel: one row per
+switch, newest first, reading `2m ago · fork #15 · replaced #20 084b94da6a… ·
++14 work`, with the full hashes, the peer, both work totals and both block counts
+in the tooltip. It comes from `/api/info`'s `reorgHistory` rather than from what
+the page happened to witness, so reloading or restarting changes nothing.
+
+Writing is atomic (a temporary file is renamed over the old one) and a missing,
+truncated or foreign-network file reads as "no switches yet": this is diagnostic
+detail, not consensus state, and a damaged file must not stop a node from
+starting. A failed write is logged and the in-memory list stays correct for the
+rest of the run.
 
 | Route | Description |
 | --- | --- |
-| `GET /api/info` | Network, height, tip, difficulty, chain work, supply, mempool, peers, per-peer byte totals, discovery, announced address, last reachability result, pid, last reorg |
+| `GET /api/info` | Network, height, tip, difficulty, chain work, supply, mempool, peers, per-peer byte totals, discovery, announced address, last reachability result, pid, last reorg and the retained switch history |
 | `GET /api/backup` | Backup schedule, recovery history, next run, last archive and newest job |
-| `POST /api/backup` | Start a verified backup now; answers `202` with a job (`409` when one is already running) |
-| `GET /api/backup/jobs/:id` | One backup job: `state` (`running`, `succeeded`, `failed`), the archive, or the error |
+| `POST /api/backup` | Start a verified backup now, optionally with `{"destination": "/abs/path"}` for an export outside the backup directory; answers `202` with a job (`409` when one is already running, `400` for a rejected destination) |
+| `GET /api/backup/jobs/:id` | One backup job: `state` (`running`, `succeeded`, `failed`, `cancelled`), `progress` (phase, blocks done of total, percent, or `null` before the first report), `discarded`, the archive, or the error |
+| `DELETE /api/backup/jobs/:id` | Stop a running backup: the worker thread is terminated and its archive deleted; answers `409` when the job already finished |
 | `GET /api/backup/download` | The newest verified archive as a gzip attachment (`409` without backups, `404` before the first one) |
 | `GET /api/backup/archives/:name` | Any retained archive by name, as a gzip attachment (`409` without backups, `404` for a name retention would not keep) |
 | `GET /api/backup` `archives[]` | Each retained archive's `name`, `bytes`, `at` and `sha256` (`null` while the file is still being read) |
@@ -850,9 +1010,20 @@ plaintext, and the old passphrase stops working as soon as the new file lands.
 then loads that written copy back through the restore path — decompressing it
 and decrypting it with the passphrase; a successful command is evidence that the
 backup is usable, not just that bytes were copied. `.gz` is appended to the path
-unless it already ends that way, and the command prints the archive name, the
-compressed size and the uncompressed one. It refuses to overwrite an existing
-file and refuses plaintext wallets, so run `wallet lock` first if necessary.
+unless it already ends that way, and the command prints the archive name, when
+it was written, the compressed size and the uncompressed one. It refuses to
+overwrite an existing file and refuses plaintext wallets, so run `wallet lock`
+first if necessary.
+
+The export records its own time in gzip's standard MTIME header field, so the
+stamp travels with the file's bytes and still reads back after the archive is
+copied to another machine — which resets the file's own times. `wallet restore`
+prints it as `backup time` in the usual `YYYY-MM-DD HH:MM:SS UTC (9m ago)` form,
+beside the labels of the keys the backup contained, so an operator can tell which
+export was just installed. Exports written before that field was recorded carry a
+zero there, and those fall back to the file's modification time, as do plain-JSON
+exports from before compression; the fallback is the file's own time, so a copied
+legacy archive reads as when it was copied rather than when it was made.
 The export is the same ciphertext as the live wallet, not a second encryption
 layer, and it must be stored separately from the passphrase.
 
@@ -864,7 +1035,37 @@ reads — decompression happens on the way in, never as a gzipped wallet file.
 `wallet restore <file>` verifies the backup’s passphrase and format, writes it
 to a temporary file, decrypts that file again, and only then renames it into
 place. It will not replace an existing wallet unless `--force` is passed. The
-restored wallet keeps the passphrase it had when the backup was made.
+restored wallet keeps the passphrase it had when the backup was made. The report
+leads with the archive's own `backup time` and then lists every restored address
+with its label (`cold storage`, `treasury` — or `unlabeled`), read from the
+decrypted backup, so the keys that came back are the ones the operator expected.
+
+**Wallet backup file format.** An export is a gzip file whose payload is the
+wallet file itself, unchanged — there is no wrapper object and no second
+encryption layer:
+
+| bytes | contents |
+| --- | --- |
+| 0–1 | `1f 8b`, gzip magic — the only marker compression is detected by |
+| 2 | `08`, deflate |
+| 3 | `00`, no optional header fields (no name, comment or header CRC) |
+| 4–7 | export time as unix seconds, little endian, in gzip’s MTIME field |
+| 8–9 | XFL and OS, written by zlib and never read back |
+| body | deflate of the wallet file, byte for byte: the version 2 JSON with encrypted keys |
+| trailer | CRC-32 of the uncompressed wallet, then its length, both little endian |
+
+The only Doubloom-specific part of the container is MTIME, which zlib leaves
+zero; the export time is patched into it after compression, and the checksum
+covers the uncompressed payload rather than the header, so the patch cannot
+corrupt the archive. A plain JSON wallet file is accepted instead of a gzip
+archive, which is what exports written before compression look like — that path
+and the gzip one both end in the same `Wallet.load`. The payload carries no
+format version of its own: its `version` field is the wallet’s (2 for encrypted,
+1 for the older plaintext format, which restore refuses). A future change is
+compatible if it keeps `readWalletBytes` able to open what `backup()` writes, or
+accepts the old shape beside the new one; the tests build an archive from these
+bytes by hand and restore from it, so a writer change that silently breaks old
+exports fails there rather than in an operator’s hands.
 
 **Node backups.** `backup <file>` writes one gzip-compressed JSON archive
 containing every confirmed block and the encrypted wallet. `.gz` is appended to
@@ -977,7 +1178,18 @@ archive. Timestamps carry milliseconds, which is what keeps two archives written
 in the same second distinct.
 
 `--backup-max-age <min>` sets how old the newest archive may get before the node
-complains; it defaults to twice the interval, with a floor of one minute. A
+complains; it defaults to twice the interval, with a floor of one minute.
+`--backup-max-lag <blocks>` is its companion for the chain itself: how many
+blocks the newest archive may fall behind the tip before it is treated as no
+longer representing the chain. Left unset it is derived from the schedule — one
+interval's worth of blocks — so a faster schedule is judged proportionally
+rather than by a figure tuned for hourly snapshots: an hourly schedule at
+Bitcoin's ten-minute spacing gets six, a ten-minute schedule gets one, and a
+six-hour one gets thirty-six. The block spacing comes from the network
+parameters, so devnet's one-minute blocks give ten blocks for the same
+ten-minute schedule. The derived value never falls below one, even for an
+interval shorter than a block, and it travels with the schedule, so the explorer
+and `backup status` report the limit the node is actually using. A
 ten-second watchdog checks the age and warns once per stale episode, so a stalled
 schedule is loud without being repeated on every tick:
 
@@ -1000,20 +1212,68 @@ recovery on its first new archive as well. The line is written after
 emitted once per stale episode rather than on every run, and goes to stdout
 like other successes — the watchdog's warning stays on stderr.
 
+The recovery is also recorded in the schedule's recovery history, beside the ones
+written when the node re-arms a missing timer, with the same sentence as its
+reason (`the previous archive was 2.1 h old, past the 2 h limit; fresh archives
+are being written again (height 812)`). That history is persisted with the rest
+of `backup-status.json`, so `backup status` and the explorer still report the
+episode after a restart, when the logs that saw it are long gone.
+
 The warning re-arms after the next successful backup, and the explorer's
 `overdue` state uses the same configured limit rather than its own rule, with
 the measured age and the limit shown in the note. `doubloom backup status`
 reports the limit alongside the rest of the schedule.
 
 Age is not the only way an archive goes stale, so the panel also watches the
-height: when the newest archive is more than six blocks behind the tip — a full
-interval of history at ten-minute blocks — it reads `behind tip` with the gap,
-the limit and the archive height spelled out, even though the age limit has not
-been reached. The check is ordered after the age rule, so an archive that is
+height: when the newest archive is more than `--backup-max-lag` blocks behind the
+tip — one interval's worth of blocks by default, six for an hourly schedule at
+ten-minute spacing — it reads
+`behind tip` with the gap, the limit and the archive height spelled out, even
+though the age limit has not been reached. Like the age limit, this one is the
+node's: `/api/backup` reports `maxLagBlocks`, the panel compares against it and
+prints it in the Schedule row (`· lag 2 blocks`), and `doubloom backup status`
+reports the same figure, so a node started with a stricter limit is judged by it
+rather than by a number baked into the page. A node too old to report the field
+falls back to six, the value an hourly mainnet schedule derives. The check is
+ordered after the age rule, so an archive that is
 both older than the limit and far behind still reads `overdue`, and a failed
 attempt still reads `last attempt failed`; the flag clears as soon as a backup
 lands at the tip. The Archived height row already reports the same gap, so the
 number in the note is the one beside it rather than a second measurement.
+
+The same rule is watched from the node itself, so an operator reading the log
+rather than the page is told too. The ten-second watchdog that checks the
+archive's age also compares its height with the tip, and once the gap passes the
+configured limit it writes one warning per episode:
+
+```
+warning: the newest automatic backup is 9 blocks behind the tip (limit 6); it is within the age limit but no longer represents the chain
+```
+
+An archive that is merely old is the age warning's business — it already says the
+schedule stopped — so the lag warning stays quiet while that one stands, the same
+precedence the panel gives `overdue` over `behind tip`. The warning is not left as
+the last word either: the run that replaces the lagging archive closes the episode
+and says so in the shape the age recovery uses, naming the gap and the new height.
+
+```
+backup schedule recovered: the previous archive was 9 blocks behind the tip (limit 6); fresh archives are being written again (height 812)
+```
+
+That sentence is also recorded in the persisted recovery history, so a node that
+restarts still reports the episode in `backup status` and the explorer. It replaces
+the bare all-clear for this case, which is kept for the rarer one where a check
+finds the gap closed without a run (a reorg onto a shorter but heavier chain):
+
+```
+backup lag cleared: the newest automatic backup is 1 block behind the tip, within the 6 blocks limit
+```
+
+An archive that is both old and far behind reports the age recovery only, since
+that sentence already covers the episode.
+
+The gap comes from the tip the node hands the schedule, so it follows the chain
+the node is actually on — including after a reorg — without reading an archive.
 
 A failed backup is logged and the schedule continues; it never stops the node.
 On a running node the whole job — snapshot, gzip, then reading the archive back
@@ -1037,11 +1297,18 @@ error if one occurred. `GET /api/backup` returns that record while the node is
 running (`{ "enabled": false }` when no schedule is configured), along with
 `nextRunAt`, `running`, `waitingForSync`, `syncWaitStartedAt` and `syncWaitedMs`
 (how long the first backup has been waiting for peer sync, both `null` when it
-is not), `firstDelayMs`, `firstMaxWaitMs`, the `retention` tiers, `lastRecovery`,
-`recoveryHistory` and `recoveryHistoryLimit` for the live schedule.
+is not), `elapsedFraction` (0–1, how far through the current wait the schedule
+is, measured from when that cycle began and never inferred from the countdown)
+with `cycleMs` (the length of the wait it measures), `firstDelayMs`,
+`firstMaxWaitMs`, `maxAgeMs` and `maxLagBlocks` (the thresholds the panel judges
+an archive by, so it never invents its own), the `retention` tiers,
+`lastRecovery`, `recoveryHistory` and `recoveryHistoryLimit` for the live
+schedule.
 `lastRecovery` is the newest recovery or `null`; `recoveryHistory` lists the
 most recent recoveries up to the configured depth, newest first, each with `at`
-and `reason`. The node prints the last and next scheduled backup at startup,
+and `reason`. A recovery is the schedule re-arming a missing timer, or a run
+replacing an archive that was past the age limit or too far behind the tip; all of
+them are written to the status file, so the history survives a restart. The node prints the last and next scheduled backup at startup,
 with
 the configured first-backup delay beside the next time, while `doubloom info`
 shows a `backup config` line with the interval, archive retention and recovery
@@ -1058,23 +1325,70 @@ owning PID, but no keys or passphrase; the PID check keeps `info` from reporting
 a schedule after the node has exited. `doubloom backup status` prints the same record in more detail:
 node state, interval, retention and recovery depth, directory, the configured
 first-backup delay alongside the next run and its countdown, the last archive's
-clock time with how long ago it was taken, its path, height and size, the
-retained recovery times and reasons, and the last error with its attempt time. It reports
+clock time with how long ago it was taken, its path, height, compressed and
+uncompressed size with the gzip saving, and how many keys it holds
+(`height 3 · 1,940 bytes gzipped (from 4,818 raw, 60% smaller) · 2 keys`), one
+`retained` line per archive the retention tiers keep — with its size and how long
+it took to write (`2026-11-01 00:05:24 UTC · 1.4 KiB · wrote in 232ms`) — the
+retained recovery times, each with how long ago it happened and its reason
+(`2026-11-01 00:41:02 UTC (3h 30m ago) · timer was missing`), and the last error
+with its attempt time and age. Attempts and recoveries are stamped exactly but
+read as ages too, in the same `(3h 30m ago)` form the last archive uses, so the
+panel does not leave the subtraction to the reader. It reports
 `not configured` when no automatic backup has ever been set up in that data
-directory.
+directory. The duration comes from a record the schedule keeps for every write
+it performs: `archiveWrites` in `backup-status.json` holds, per archive name, the
+clock time the attempt began (`startedAt`, the same instant the archive is dated
+by) and the time its file finished being written (`finishedAt`, the file's last
+write, captured as the run completed rather than read back later). A recorded
+pair wins over anything on disk — copying or restoring an archive moves its mtime,
+but not what the run did. Archives from before that record existed fall back to
+what is on disk: the name for the attempt, the mtime for the finish. Both are
+shown below a second in milliseconds, because a small chain's archive lands in
+tens of them and `0.0s` would say nothing; an archive with neither a record nor a
+usable mtime is marked `write time not recorded` rather than showing a negative
+or invented figure. Records for archives retention has pruned are dropped, and
+the map is capped so a long-lived node cannot grow it without bound.
 
 `doubloom backup status --json` prints the same record as one JSON object for
-scripts: `network`, `statusFile`, `configured`, `running` (whether the recorded
-pid is alive, so callers do not reimplement that check), `pid`, `directory`,
-`intervalMs`, `firstDelayMs`, `firstMaxWaitMs`, `maxAgeMs`, `retention`,
-`recoveryHistoryLimit`, `nextRunAt`, `waitingForSync`, `lastAttemptAt`,
+scripts: `verdict`, `lastArchiveAgeMs`, `maxArchiveAgeMs`, `tipHeight`, `network`, `statusFile`, `configured`, `running`
+(whether the recorded pid is alive, so callers do not reimplement that check),
+`pid`, `directory`,
+`intervalMs`, `firstDelayMs`, `firstMaxWaitMs`, `maxAgeMs`, `maxLagBlocks`,
+`retention`,
+`recoveryHistoryLimit`, `nextRunAt`, `waitingForSync`, `elapsedFraction`,
+`cycleMs`, `lastAttemptAt`,
 `lastError`, `lastBackup`
-(`at`, `height`, `tip`, `path`, `bytes`, `keys`), `lastRecovery` and
-`recoveryHistory`. Timestamps stay ISO-8601 as stored, so nothing is rounded or
+(`at`, `height`, `tip`, `path`, `bytes`, `keys`), `lastRecovery`,
+`recoveryHistory` and `archives` — the retained archives newest first, each with
+its `name`, the attempt `at`, the write's `startedAt` and `finishedAt`, `bytes`
+and `writeMs` (`null` when it cannot be worked out). Timestamps stay ISO-8601 as stored, so nothing is rounded or
 localised, and a data directory without a status file still prints a complete
 object with `configured: false` and nulls rather than failing — a script can
 branch on `configured` instead of parsing text or catching an error. The plain
-output is unchanged and remains the default. When the recorded pid is gone,
+output is unchanged and remains the default.
+
+`verdict` is the judgement itself, so those rules are not reimplemented per
+script: `unknown` when no schedule is recorded, `waiting` before the first
+archive, `failed` when the last attempt failed after the newest archive was
+written, `stale` when that archive is older than the age limit, `behind` when it
+trails the tip by more than the lag limit, and `healthy` otherwise. Age outranks
+lag — an archive that is both reads `stale`, matching the panel's `overdue` over
+`behind tip` — and a failed attempt outranks both, since it says the schedule is
+trying and not succeeding. `tipHeight` is the chain height the lag rule compared
+against, read from the chain file so the answer does not need a node running;
+with no chain to read it is `null`, only the age rule applies, and `healthy` then
+means "not stale" rather than "also at the tip".
+
+`lastArchiveAgeMs` is how old the newest archive was when the record was read,
+in milliseconds (`null` when there is no archive or its time does not parse), and
+`maxArchiveAgeMs` is the limit that age is judged against: the recorded `maxAgeMs`
+when there is one, otherwise twice the interval with a one-minute floor. Both are
+measured at the same instant as `verdict`, from the same code, so a script can
+compare the two directly — `age > limit` is exactly the `stale` rule — without
+subtracting timestamps against its own clock or reimplementing the fallback, and
+without the reported age ever disagreeing with the word beside it. `--watch`
+re-measures on every redraw, so the age grows while the panel is on screen. When the recorded pid is gone,
 `nextRunAt` and `waitingForSync` are `null`/`false` even though the status file
 still holds the timestamp the dead node intended: that run will never happen, and
 `lastBackup` is kept so a stopped node's last archive is still readable.
@@ -1093,10 +1407,27 @@ per second, and carries no cursor control. `--watch` and `--json` are different
 jobs — a live panel and a single machine-readable record — so asking for both is
 a usage error.
 
+`DELETE /api/backup/jobs/:id` stops a run in progress. A backup spends its time
+in synchronous work on the worker thread, so there is no point at which it can
+be asked to stop politely: the thread is terminated, the archive it had begun —
+complete but never verified, or truncated mid-write — is deleted, and the job
+settles as `cancelled` with `discarded` naming the file that was removed (or
+`null` when it stopped before one existed). The response is held until the file
+is actually gone, so a caller never sees "cancelled" while an unverified archive
+is still on disk, and the thread is replaced on the next run. A cancelled run is
+not recorded as the schedule's last backup, and cancelling a job that already
+finished answers `409`.
+
 `POST /api/backup` runs one backup immediately, using the same verified archive
 and retention rules. It returns the archive summary and updated status, `409` if
 no schedule is configured or another backup is already running, and `500` if the
-backup itself fails. Like a scheduled run, it performs full chain validation on
+backup itself fails. An optional body, `{"destination": "/abs/path"}`, turns
+the run into an export: the archive is written and verified at that path rather
+than in the backup directory, and is not recorded as the schedule's last backup
+or subject to pruning. The path must be absolute and outside `--backup-dir`;
+otherwise the request is refused with `400` before anything is written. The job
+records the requested `destination` and its `backup.at` is the export's own
+completion time, so an export cannot be mistaken for an automatic backup. Like a scheduled run, it performs full chain validation on
 the node’s event loop, so RPC and mining pause briefly while it works.
 
 Passphrases are never taken as command-line arguments; scripts can set
@@ -1140,7 +1471,7 @@ Node 18.x and 20.x for every push, on any branch — the oldest version
 `engines.node` allows and the current LTS. The two legs run independently
 (`fail-fast: false`), so a break on the minimum version is reported as that,
 rather than cancelling the leg that still passes. The suite is green on both:
-109 tests on Node 18.20.8 as well as on Node 20.18. The project has no
+143 tests on Node 18.20.8 as well as on Node 20.18. The project has no
 dependencies, so the workflow has no install step and needs no lockfile; add
 `npm ci` and commit a lockfile if dependencies ever appear. The suite uses only
 Node's built-in test runner and temp directories, so it runs the same on Linux,
@@ -1152,10 +1483,50 @@ maturity, double-spend/signature/low-fee rejection, malformed blocks, reorgs by
 cumulative work, difficulty retargeting, transactions chained within one block,
 and wallet encryption: ciphertext secrecy, authenticated-data binding, wrong
 passphrase rejection, in-place passphrase rotation, wallet and whole-node
-backup verification and restore, scheduled backups with configurable first
-delay, sync-gated warmup and retention, persisted next-run and backup status
-reporting, failure isolation, overwrite refusal, tampered-chain rejection, and
-the lock/unlock format conversion.
+backup verification and restore, an export's own stamp surviving a copy that
+resets the file time (and the mtime fallback for archives that carry none),
+`wallet restore` naming the export it installed with its labels, the backup
+container's documented bytes (header fields, MTIME, payload and a hand-built
+archive restoring, plus a corrupted body refused by the checksum), scheduled
+backups with configurable first
+delay, sync-gated warmup and retention, backup progress (blocks written then
+re-verified, monotonic and bounded, across the worker thread to the caller) and
+cancellation (the thread stopped mid-run, its archive deleted, the job marked
+`cancelled` and the worker still usable afterwards),
+exports to an explicit destination
+(absolute and outside the retention directory, verified on restore and kept out
+of the schedule's records), persisted next-run and backup status
+reporting, the progress the schedule reports through a wait (starting at zero,
+climbing with the clock, unchanged by a manual archive mid-cycle, and accurate
+after a re-arm that kept only the remainder, while a sync wait and a stopped
+schedule report no fraction at all), per-archive write durations taken from the
+recorded `startedAt`/`finishedAt` pair (outranking a moved mtime), falling back
+to the name's attempt stamp and the file's last write (milliseconds below a
+second, a copy whose mtime predates its name reporting none, a half-written
+record ignored, pruned archives forgotten, and both ends reported in
+`backup status --json`), the configurable block-lag limit (its derivation from
+the interval for mainnet and devnet spacing, the floor of one, its persistence,
+a stricter limit reaching the startup log and both `backup status` modes, a bad
+flag refused before the node binds, and the panel reading the node's figure
+instead of its own), the lag warning and its all-clear (once per
+episode, silent at the limit itself, and not repeated while the age warning
+stands), a run replacing a lagging archive logging the recovery and recording it
+in the persisted history, the archive's raw size and key count reaching
+`backup status` (and an older record without them printing only what it has), the
+`stale`/`behind`/`failed`/`waiting`/`healthy` verdict `backup status --json`
+computes from those same limits, with the archive age it was reached from and the
+limit that age is judged against (including the interval-derived limit when the
+record carries none), a stale-to-fresh recovery joining that same on-disk
+history and being read back by a node that starts later, failure isolation,
+overwrite refusal, tampered-chain rejection, and
+the lock/unlock format conversion, chain-work formatting at the shortening
+boundary (including that the explorer's copy matches the CLI's), the chain fetch
+after a rejected push asking the sender first, falling back to the other peers
+when it has nothing new and timing the switch that follows, the node log levels
+(transaction lines dropped while block events survive, and an unknown level
+refused before the node binds), and the chain-switch history: bounding,
+newest-first order, damaged and foreign files, the branch a reorg replaced and
+its replaced work, and that the file survives a node restart.
 
 ## Benchmarks
 
