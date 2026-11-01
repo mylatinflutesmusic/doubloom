@@ -395,6 +395,11 @@ export function startNode(options) {
       state: job.state,
       requestedAt: job.requestedAt,
       finishedAt: job.finishedAt ?? null,
+      // Where an export was asked to land; null for a retention-directory run.
+      destination: job.destination ?? null,
+      progress: job.progress ?? null,
+      // The archive a cancelled run had to throw away, when there was one.
+      discarded: job.discarded ?? null,
       backup: job.backup ?? null,
       error: job.error ?? null,
     };
@@ -439,6 +444,9 @@ export function startNode(options) {
         firstDelayMs: options.backup.firstDelayMs,
         firstMaxWaitMs: options.backup.firstMaxWaitMs,
         firstReady: () => syncSettled,
+        // Lets the schedule warn when its newest archive falls behind the chain
+        // it is supposed to represent.
+        tipHeight: () => chain.height,
         // Compressing and validating an archive is CPU-bound for seconds on a
         // real chain; doing it here would stall peer sync, mining and the API.
         runBackup: (job) => backupWorker.runBackup(job),
@@ -448,6 +456,7 @@ export function startNode(options) {
         verifyIntervalMs: options.backup.verifyIntervalMs,
         intervalMs: options.backup.intervalMs,
         maxAgeMs: options.backup.maxAgeMs,
+        maxLagBlocks: options.backup.maxLagBlocks,
         retention: options.backup.retention,
         recoveryHistoryLimit: options.backup.recoveryHistoryLimit,
       })
@@ -1195,6 +1204,44 @@ export function startNode(options) {
       return;
     }
 
+    // Stop a run: the worker thread is terminated, whatever it wrote is deleted,
+    // and the job settles as `cancelled` rather than `failed`. The response is
+    // held until that has happened, so a client is never told "cancelled" while
+    // an unverified archive is still on disk.
+    if (method === 'DELETE' && pathname.startsWith('/api/backup/jobs/')) {
+      const id = decodeURIComponent(pathname.slice('/api/backup/jobs/'.length));
+      const job = backupJobs.get(id);
+      if (!job) {
+        sendJson(response, 404, { error: `unknown backup job: ${id}` });
+        return;
+      }
+      if (job.state !== 'running') {
+        sendJson(response, 409, {
+          error: `the backup already ${job.state === 'succeeded' ? 'finished' : job.state}`,
+          job: snapshotBackupJob(job),
+        });
+        return;
+      }
+      if (!backupWorker.cancelRunning()) {
+        sendJson(response, 409, {
+          error: 'no backup is running',
+          job: snapshotBackupJob(job),
+        });
+        return;
+      }
+      // Bounded: a thread that refuses to stop must not hold the request open.
+      await Promise.race([
+        job.done,
+        new Promise((resolve) => setTimeout(resolve, 5000)),
+      ]);
+      sendJson(response, 200, {
+        ok: true,
+        job: snapshotBackupJob(job),
+        status: backupSchedule?.status() ?? null,
+      });
+      return;
+    }
+
     if (method === 'POST' && pathname === '/api/backup') {
       if (!backupSchedule) {
         sendJson(response, 409, {
@@ -1217,18 +1264,35 @@ export function startNode(options) {
         return;
       }
 
+      // An optional destination turns the run into an export: the archive is
+      // written where the caller asked, outside the directory the schedule owns.
+      // Nothing until now read a body here, so an empty request is still valid.
+      const body = await readJson(request, 10_000).catch(() => ({}));
+      const destination =
+        typeof body?.destination === 'string' ? body.destination : null;
+
       const job = {
         id: randomUUID(),
         state: 'running',
         requestedAt: new Date().toISOString(),
         finishedAt: null,
+        destination,
+        // Blocks written and re-verified, as the worker reports them; null
+        // until the first message, so a client can tell "no figure yet" from
+        // "nothing done".
+        progress: null,
         backup: null,
         error: null,
       };
 
       let pending;
       try {
-        pending = backupSchedule.runNow();
+        pending = backupSchedule.runNow({
+          destination,
+          onProgress: (progress) => {
+            job.progress = progress;
+          },
+        });
       } catch (error) {
         // Synchronous guards (a stopped schedule, or a scheduled run that got
         // there first): report it instead of handing out a job that never ran.
@@ -1236,7 +1300,14 @@ export function startNode(options) {
         job.finishedAt = new Date().toISOString();
         job.error = error.message;
         rememberBackupJob(job);
-        sendJson(response, /already running|stopped/.test(error.message) ? 409 : 500, {
+        // A rejected destination is the caller's mistake, not the node's; a
+        // busy or stopped schedule is a conflict.
+        const status = /already running|stopped/.test(error.message)
+          ? 409
+          : /destination/.test(error.message)
+            ? 400
+            : 500;
+        sendJson(response, status, {
           error: error.message,
           job: snapshotBackupJob(job),
           status: backupSchedule.status(),
@@ -1245,18 +1316,31 @@ export function startNode(options) {
       }
 
       rememberBackupJob(job);
-      Promise.resolve(pending).then(
+      // Kept on the job so a cancel request can wait for the run to settle — and
+      // for the archive it wrote to be removed — before it answers.
+      job.done = Promise.resolve(pending).then(
         (result) => {
           job.state = 'succeeded';
           job.finishedAt = new Date().toISOString();
           job.backup = {
             ...result,
-            at: backupSchedule.status().lastBackup?.at ?? null,
+            // An export never becomes the schedule's last backup, so it reports
+            // when it finished rather than borrowing that archive's timestamp.
+            at: destination
+              ? job.finishedAt
+              : (backupSchedule.status().lastBackup?.at ?? null),
           };
         },
         (error) => {
-          job.state = 'failed';
           job.finishedAt = new Date().toISOString();
+          if (error?.cancelled) {
+            // Stopped by an operator: not a failure, and the file it left is
+            // already gone. `discarded` names it so the caller can say so.
+            job.state = 'cancelled';
+            job.discarded = error.discarded ?? null;
+            return;
+          }
+          job.state = 'failed';
           job.error = error.message;
         },
       );
@@ -1935,12 +2019,14 @@ export function startNode(options) {
         backupStatus.firstMaxWaitMs > 0
           ? `, sync wait cap ${formatBackupDelay(backupStatus.firstMaxWaitMs)}`
           : '';
-      console.log(
-        `Automatic backups: ${backupSchedule.directory} every ${minutes} min (keep ${tiers || 'nothing'}, recoveries ${backupStatus.recoveryHistoryLimit ?? 5}, max age ${formatBackupDelay(backupStatus.maxAgeMs)}${verify}${syncWaitCap})`,
+      log('blocks',
+        `Automatic backups: ${backupSchedule.directory} every ${minutes} min (keep ${tiers || 'nothing'}, recoveries ${backupStatus.recoveryHistoryLimit ?? 5}, max age ${formatBackupDelay(backupStatus.maxAgeMs)}, lag ${backupStatus.maxLagBlocks} block${
+          backupStatus.maxLagBlocks === 1 ? '' : 's'
+        }${verify}${syncWaitCap})`,
       );
       const lastBackup = backupStatus.lastBackup;
       if (lastBackup) {
-        console.log(
+        log('blocks',
           `Last automatic backup: ${lastBackup.at} (height ${lastBackup.height}) ${lastBackup.path}`,
         );
       }
@@ -1948,7 +2034,7 @@ export function startNode(options) {
         const firstDelay = Number.isFinite(backupStatus.firstDelayMs)
           ? ` (first delay ${formatBackupDelay(backupStatus.firstDelayMs)})`
           : '';
-        console.log(`Next automatic backup: ${backupStatus.nextRunAt}${firstDelay}`);
+        log('blocks', `Next automatic backup: ${backupStatus.nextRunAt}${firstDelay}`);
       }
       if (!syncSettled) {
         const cap =
@@ -1956,7 +2042,7 @@ export function startNode(options) {
           backupStatus.firstMaxWaitMs > 0
             ? ` for up to ${formatBackupDelay(backupStatus.firstMaxWaitMs)}, then backs up anyway`
             : ' indefinitely (--backup-first-max-wait 0)';
-        console.log(`First automatic backup waits for peer sync to settle${cap}`);
+        log('blocks', `First automatic backup waits for peer sync to settle${cap}`);
       }
     }
     discoverPeers();

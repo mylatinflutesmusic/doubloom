@@ -566,6 +566,22 @@
         cursor: not-allowed;
       }
 
+      /* Stopping a run is a different kind of action from starting one, so it
+         does not borrow the gold of the primary button. */
+      .backup-actions button.cancel {
+        border-color: rgba(232, 160, 160, 0.4);
+        background: rgba(232, 160, 160, 0.06);
+        color: #e8a0a0;
+      }
+
+      .backup-actions button.cancel:hover:not(:disabled) {
+        background: rgba(232, 160, 160, 0.14);
+      }
+
+      .backup-actions button[hidden] {
+        display: none;
+      }
+
       /* Every archive retention has kept, so any of them can be fetched rather
          than only the one the schedule calls newest. */
       .backup-archives {
@@ -830,6 +846,7 @@
         </dl>
         <div class="backup-actions">
           <button type="button" id="backup-now" disabled>Back up now</button>
+          <button type="button" id="backup-cancel" class="cancel" hidden>Cancel</button>
           <span class="backup-action-status" id="backup-action-status" role="status" aria-live="polite"></span>
         </div>
         <div class="backup-archives" id="backup-archives" hidden>
@@ -930,6 +947,7 @@
       let backupEnabled = false;
       let backupInFlight = false;
       let nextBackupAt = null;
+      let backupFirstMaxWaitMs = null;
       let backupWaitingForSync = false;
       let backupFirstDelayMs = null;
       // How long the node said the first backup had been waiting for peer sync,
@@ -938,8 +956,11 @@
       // once per five-second refresh (and no clock agreement is needed).
       let backupSyncWaitedMs = null;
       let backupSyncWaitedAt = 0;
-      // How long the current wait is: the first delay before the first archive,
-      // the interval after that. The ring is a fraction of this.
+      // The node reports how far through the current wait it is, along with the
+      // length of that wait. The ring draws the reported fraction; the page only
+      // advances it between polls, and never works it out from timestamps.
+      let backupElapsedFraction = null;
+      let backupElapsedAt = 0;
       let backupCycleMs = null;
       let backupNextRunMissingSince = null;
       // When the answering node started, from /api/info, so the uptime counter
@@ -1009,16 +1030,16 @@
 
       const RING_CIRCUMFERENCE = 2 * Math.PI * 9;
 
-      // An archive only helps if it still represents the chain. With ten-minute
-      // blocks, six blocks is a full interval of history the newest archive does
-      // not have — enough that "recently written" and "up to date" differ.
-      const BACKUP_LAG_BLOCKS = 6;
+      // An archive only helps if it still represents the chain. The node reports
+      // the limit it was configured with (`--backup-max-lag`); six is the default
+      // it uses, kept here only for a node too old to report the figure.
+      const DEFAULT_MAX_LAG_BLOCKS = 6;
 
-      function renderNextRing(remaining) {
+      function renderNextRing() {
         const ring = $("next-ring");
         const fill = $("next-ring-fill");
         if (
-          nextBackupAt === null ||
+          backupElapsedFraction === null ||
           !Number.isFinite(backupCycleMs) ||
           backupCycleMs <= 0 ||
           backupWaitingForSync
@@ -1030,7 +1051,14 @@
           fill.style.strokeDashoffset = `${RING_CIRCUMFERENCE}`;
           return;
         }
-        const elapsed = Math.min(1, Math.max(0, 1 - remaining / backupCycleMs));
+        // The node's figure is a snapshot; only the time since this page heard
+        // it is added, so the ring moves every second without the page ever
+        // deciding where in a wait it is.
+        const elapsed = Math.min(
+          1,
+          backupElapsedFraction +
+            Math.max(0, Date.now() - backupElapsedAt) / backupCycleMs,
+        );
         fill.style.strokeDasharray = `${RING_CIRCUMFERENCE}`;
         fill.style.strokeDashoffset = `${RING_CIRCUMFERENCE * (1 - elapsed)}`;
         ring.toggleAttribute("hidden", false);
@@ -1047,23 +1075,33 @@
         if (nextBackupAt === null) {
           target.textContent = "—";
           target.removeAttribute("title");
-          renderNextRing(0);
+          renderNextRing();
           return;
         }
         const firstDelay = Number.isFinite(backupFirstDelayMs)
           ? ` · first delay ${duration(backupFirstDelayMs)}`
           : "";
+        // Same trailing hint `doubloom info` prints: zero means the first wait is
+        // uncapped, which info leaves unsaid rather than showing a limit.
+        const firstWait =
+          Number.isFinite(backupFirstMaxWaitMs) && backupFirstMaxWaitMs > 0
+            ? ` · sync wait cap ${duration(backupFirstMaxWaitMs)}`
+            : "";
         const remaining = nextBackupAt - Date.now();
         const waited = backupWaitingForSync ? syncWaitedNow() : null;
         target.title = new Date(nextBackupAt).toISOString();
-        target.textContent = `${
+        // The clock time first, the countdown parenthesised after it — the form
+        // `doubloom info` and `backup status` use, so the same run reads the same
+        // way in the terminal and on the page. The page adds how long the first
+        // backup has been waiting, which the terminal leaves out.
+        target.textContent = `${utcTime(nextBackupAt)} (${
           backupWaitingForSync
             ? `waiting for sync${
                 Number.isFinite(waited) ? ` ${duration(waited)}` : ""
               }`
             : formatCountdown(remaining)
-        }${firstDelay}`;
-        renderNextRing(remaining);
+        })${firstDelay}${firstWait}`;
+        renderNextRing();
       }
 
       // Archives are gzip JSON, so sizes land in the kilobyte range for small
@@ -1206,6 +1244,11 @@
           const graceMs = Number.isFinite(backup.maxAgeMs)
             ? backup.maxAgeMs
             : Math.max(Number(backup.intervalMs) * 2, 60000);
+          // Same treatment for the block limit: use the configured one, and fall
+          // back only when the node does not report it.
+          const lagBlocks = Number.isInteger(backup.maxLagBlocks)
+            ? backup.maxLagBlocks
+            : DEFAULT_MAX_LAG_BLOCKS;
           const failedSinceLast =
             backup.lastError &&
             backup.lastAttemptAt &&
@@ -1220,12 +1263,12 @@
             label = "overdue";
             note.textContent = `No successful backup for ${duration(ageMs)}; the limit is ${duration(graceMs)}.`;
             note.hidden = false;
-          } else if (Number.isFinite(behind) && behind > BACKUP_LAG_BLOCKS) {
+          } else if (Number.isFinite(behind) && behind > lagBlocks) {
             level = "warn";
             label = "behind tip";
             note.textContent = `The newest archive is ${formatNumber(
               behind,
-            )} blocks behind the tip (limit ${BACKUP_LAG_BLOCKS}); it is newer than the age limit but no longer represents the chain.`;
+            )} blocks behind the tip (limit ${lagBlocks}); it is newer than the age limit but no longer represents the chain.`;
             note.hidden = false;
           } else {
             level = "ok";
@@ -1257,15 +1300,23 @@
               : `${formatNumber(behind)} block${behind === 1 ? "" : "s"} behind tip`;
           // The archive's size sits with its height: together they say how much
           // history the file holds and how big the copy on disk is. When the
-          // node records the uncompressed size, the gzip saving is shown too.
+          // node recorded the uncompressed size, both figures are shown — what
+          // the file costs to keep and what it holds — followed by the saving.
+          const hasRaw =
+            Number.isFinite(last.rawBytes) && last.rawBytes > last.bytes;
           const sizeText = Number.isFinite(last.bytes)
-            ? ` · ${fileSize(last.bytes)}`
+            ? hasRaw
+              ? ` · ${fileSize(last.bytes)} gz · ${fileSize(last.rawBytes)} raw`
+              : ` · ${fileSize(last.bytes)}`
             : "";
           const savedPercent =
             Number.isFinite(last.rawBytes) && last.rawBytes > last.bytes
               ? Math.round((1 - last.bytes / last.rawBytes) * 100)
               : null;
           const savedText = savedPercent === null ? "" : ` · saved ${savedPercent}%`;
+          const keyText = Number.isFinite(last.keys)
+            ? ` · ${formatNumber(last.keys)} key${last.keys === 1 ? "" : "s"}`
+            : "";
           $("backup-height").textContent = `#${formatNumber(last.height)}${lagText ? ` · ${lagText}` : ""}${sizeText}${savedText}`;
           if (Number.isFinite(last.bytes)) {
             $("backup-height").title =
@@ -1273,7 +1324,7 @@
                 savedPercent === null
                   ? ""
                   : ` (from ${formatNumber(last.rawBytes)}, ${savedPercent}% smaller)`
-              }`;
+              }${keyText}`;
           } else {
             $("backup-height").removeAttribute("title");
           }
@@ -1305,6 +1356,12 @@
             }${
               Number.isFinite(backup.maxAgeMs)
                 ? ` · max age ${duration(backup.maxAgeMs)}`
+                : ""
+            }${
+              Number.isInteger(backup.maxLagBlocks)
+                ? ` · lag ${formatNumber(backup.maxLagBlocks)} block${
+                    backup.maxLagBlocks === 1 ? "" : "s"
+                  }`
                 : ""
             }`
           : "—";
@@ -1373,15 +1430,20 @@
         backupFirstDelayMs = Number.isFinite(backup?.firstDelayMs)
           ? backup.firstDelayMs
           : null;
-        // The first wait is the configured delay; later waits are the interval.
-        // A recovered schedule can preserve a partial remainder, which the ring
-        // reads as further along than a fresh interval would be.
-        const span = backup?.lastBackup
-          ? backup?.intervalMs
-          : Number.isFinite(backup?.firstDelayMs)
-            ? backup.firstDelayMs
-            : backup?.intervalMs;
-        backupCycleMs = Number.isFinite(span) && span > 0 ? span : null;
+        backupFirstMaxWaitMs = Number.isFinite(backup?.firstMaxWaitMs)
+          ? backup.firstMaxWaitMs
+          : null;
+        // The schedule's own progress, which a recovered schedule measures from
+        // where its wait actually began — long before this node re-armed the
+        // timer. Null whenever the node has no wait to measure.
+        backupElapsedFraction = Number.isFinite(backup?.elapsedFraction)
+          ? Math.min(1, Math.max(0, backup.elapsedFraction))
+          : null;
+        backupElapsedAt = Date.now();
+        backupCycleMs =
+          Number.isFinite(backup?.cycleMs) && backup.cycleMs > 0
+            ? backup.cycleMs
+            : null;
         const nextRun = backup?.enabled && backup.nextRunAt
           ? Date.parse(backup.nextRunAt)
           : Number.NaN;
@@ -1712,14 +1774,50 @@
             throw new Error("timed out waiting for the backup to finish");
           }
           const seconds = Math.round((Date.now() - started) / 1000);
-          $("backup-action-status").textContent = `Writing and verifying archive… ${seconds}s`;
+          // The node counts blocks written and then re-verified; a node that
+          // reports nothing leaves the line as elapsed time alone.
+          const percent = Number.isInteger(job.progress?.percent)
+            ? `${job.progress.percent}% · `
+            : "";
+          $("backup-action-status").textContent = `Writing and verifying archive… ${percent}${seconds}s`;
           await new Promise((resolve) => setTimeout(resolve, 1000));
+        }
+      }
+
+      // The job this page is following, so the cancel button knows what to stop.
+      let backupJobId = null;
+
+      async function cancelBackup() {
+        const id = backupJobId;
+        if (!id) return;
+        const button = $("backup-cancel");
+        button.disabled = true;
+        button.textContent = "Cancelling…";
+        try {
+          const response = await fetch(
+            `/api/backup/jobs/${encodeURIComponent(id)}`,
+            { method: "DELETE", cache: "no-store" },
+          );
+          const payload = await response.json().catch(() => ({}));
+          if (!response.ok) {
+            throw new Error(payload.error || `cancel failed (${response.status})`);
+          }
+          // The node answers only once the archive is gone; the poll in
+          // followBackupJob reports what was discarded when it sees the job
+          // settle.
+        } catch (error) {
+          const actionStatus = $("backup-action-status");
+          actionStatus.className = "backup-action-status bad";
+          actionStatus.textContent = `Could not cancel: ${error.message}`;
+          button.disabled = false;
+          button.textContent = "Cancel";
         }
       }
 
       async function backupNow() {
         if (backupInFlight) return;
         const button = $("backup-now");
+        const cancelButton = $("backup-cancel");
         const actionStatus = $("backup-action-status");
         if (button.disabled) return;
 
@@ -1745,7 +1843,20 @@
           if (!job?.id) {
             throw new Error(started.error || "the node did not return a backup job");
           }
+          // Only now is there something to cancel.
+          backupJobId = job.id;
+          cancelButton.hidden = false;
+          cancelButton.disabled = false;
+          cancelButton.textContent = "Cancel";
           const finished = await followBackupJob(job.id);
+          if (finished.state === "cancelled") {
+            actionStatus.className = "backup-action-status";
+            actionStatus.textContent = finished.discarded
+              ? `Backup cancelled · discarded ${finished.discarded}`
+              : "Backup cancelled · no archive was written";
+            await refresh();
+            return;
+          }
           if (finished.state !== "succeeded") {
             throw new Error(finished.error || "the node reported the backup failed");
           }
@@ -1759,12 +1870,17 @@
           await refresh();
         } finally {
           backupInFlight = false;
+          backupJobId = null;
+          cancelButton.hidden = true;
+          cancelButton.disabled = false;
+          cancelButton.textContent = "Cancel";
           button.textContent = "Back up now";
           button.disabled = !backupEnabled;
         }
       }
 
       $("backup-now").addEventListener("click", backupNow);
+      $("backup-cancel").addEventListener("click", cancelBackup);
       $("mine-toggle").addEventListener("click", toggleMining);
       refresh();
       setInterval(refresh, 5000);

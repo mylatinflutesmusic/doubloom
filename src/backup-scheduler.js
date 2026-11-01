@@ -32,6 +32,22 @@ const DEFAULT_RECOVERY_HISTORY_LIMIT = 5;
 //: A backup older than this many intervals is stale unless configured.
 const DEFAULT_MAX_AGE_FACTOR = 2;
 const MIN_DEFAULT_MAX_AGE_MS = 60_000;
+/**
+ * How many blocks an interval is worth, which is the default lag limit. A
+ * schedule that runs more often than hourly is judged proportionally: an hour is
+ * six blocks at Bitcoin's ten-minute spacing, so a ten-minute schedule gets one
+ * and a six-hour one gets thirty-six. A fixed six would let a fast schedule fall
+ * a dozen intervals behind before anyone noticed, and would flag a slow one for
+ * a single block. The node reports the figure it derived, so a client applies the
+ * same rule rather than keeping its own copy.
+ */
+export function defaultMaxLagBlocks(params, intervalMs) {
+  const spacingMs = Number(params?.targetBlockTime) * 1000;
+  if (!Number.isFinite(spacingMs) || spacingMs <= 0 || !Number.isFinite(intervalMs)) {
+    return 1;
+  }
+  return Math.max(1, Math.round(intervalMs / spacingMs));
+}
 // Restoring an archive is the only way to know it still restores, so the newest
 // one is checked periodically. Six hours is often enough to catch a corrupt
 // write before it ages out of retention, and rare enough to be cheap.
@@ -40,6 +56,84 @@ const STATUS_VERSION = 1;
 
 export function backupStatusFile(chainFile) {
   return path.join(path.dirname(chainFile), 'backup-status.json');
+}
+
+/**
+ * How the newest archive stands, judged by the same rules the explorer applies,
+ * so a script does not have to reimplement them: `waiting` before the first
+ * archive exists, `failed` when the last attempt failed after the newest archive
+ * was written, `stale` when that archive is older than the age limit, `behind`
+ * when it trails the tip by more than the lag limit, `healthy` otherwise, and
+ * `unknown` when no schedule is recorded at all.
+ *
+ * Age outranks lag, exactly as the panel orders `overdue` over `behind tip`: an
+ * archive that is both is reported as `stale`, because a schedule that stopped is
+ * the more direct problem. `tipHeight` is what the lag rule measures against; when
+ * it is null (no chain on disk) only the age rule is applied, and `healthy` means
+ * "not stale" rather than "also at the tip".
+ */
+/**
+ * How long ago the newest archive was written, or null when there is no archive
+ * or its time does not parse. The verdict's age rule uses this too, so a reported
+ * age and the word derived from it cannot disagree.
+ */
+export function backupAgeMs(status, nowMs = Date.now()) {
+  const at = Date.parse(status?.lastBackup?.at ?? '');
+  return Number.isFinite(at) ? nowMs - at : null;
+}
+
+/**
+ * The age a schedule tolerates before its archive counts as stale: the node's own
+ * limit when one was recorded, otherwise twice the interval (never below a
+ * minute), which is the figure the explorer falls back to.
+ */
+export function backupMaxAgeMs(status) {
+  if (Number.isFinite(status?.maxAgeMs)) {
+    return status.maxAgeMs;
+  }
+  const intervalMs = Number(status?.intervalMs);
+  return Math.max(Number.isFinite(intervalMs) ? intervalMs * 2 : 0, 60_000);
+}
+
+export function backupVerdict({ status, tipHeight = null, nowMs = Date.now() } = {}) {
+  if (!status) {
+    return 'unknown';
+  }
+  const last = status.lastBackup ?? null;
+  if (!last) {
+    return 'waiting';
+  }
+
+  // A failed attempt after the archive was written says the schedule is trying
+  // and not succeeding, which no reading of the archive's age can show.
+  if (
+    status.lastError &&
+    status.lastAttemptAt &&
+    Date.parse(status.lastAttemptAt) >= Date.parse(last.at)
+  ) {
+    return 'failed';
+  }
+
+  const maxAgeMs = backupMaxAgeMs(status);
+  const ageMs = backupAgeMs(status, nowMs);
+  if (ageMs !== null && ageMs > maxAgeMs) {
+    return 'stale';
+  }
+
+  const archived = Number(last.height);
+  const behind =
+    Number.isFinite(tipHeight) && Number.isFinite(archived)
+      ? tipHeight - archived
+      : null;
+  if (
+    Number.isInteger(status.maxLagBlocks) &&
+    behind !== null &&
+    behind > status.maxLagBlocks
+  ) {
+    return 'behind';
+  }
+
+  return 'healthy';
 }
 
 function formatDuration(milliseconds) {
@@ -66,6 +160,31 @@ function isRecovery(entry) {
     Number.isFinite(Date.parse(entry.at)) &&
     typeof entry.reason === 'string'
   );
+}
+
+/**
+ * Read the per-archive write records: when each attempt began and when its file
+ * finished being written. Entries without both timestamps are dropped, so a
+ * damaged or hand-edited status file cannot produce a nonsense duration.
+ */
+function readArchiveWrites(value) {
+  if (!value || typeof value !== 'object') {
+    return {};
+  }
+  const writes = {};
+  for (const [name, entry] of Object.entries(value)) {
+    if (
+      entry &&
+      typeof entry === 'object' &&
+      typeof entry.startedAt === 'string' &&
+      typeof entry.finishedAt === 'string' &&
+      Number.isFinite(Date.parse(entry.startedAt)) &&
+      Number.isFinite(Date.parse(entry.finishedAt))
+    ) {
+      writes[name] = { startedAt: entry.startedAt, finishedAt: entry.finishedAt };
+    }
+  }
+  return writes;
 }
 
 /** Read the persisted status, ignoring missing or unrelated files. */
@@ -120,6 +239,9 @@ export function loadBackupStatus({ statusFile, network }) {
         : null,
       intervalMs: Number.isFinite(data.intervalMs) ? data.intervalMs : null,
       maxAgeMs: Number.isFinite(data.maxAgeMs) ? data.maxAgeMs : null,
+      maxLagBlocks: Number.isInteger(data.maxLagBlocks)
+        ? data.maxLagBlocks
+        : null,
       retention: readRetention(data),
       lastBackup,
       lastRecovery,
@@ -130,6 +252,7 @@ export function loadBackupStatus({ statusFile, network }) {
       waitingForSync: data.waitingForSync === true,
       lastAttemptAt: data.lastAttemptAt ?? null,
       lastError: data.lastError ?? null,
+      archiveWrites: readArchiveWrites(data.archiveWrites),
     };
   } catch {
     return null;
@@ -316,7 +439,7 @@ export function selectRetained(archives, retention = DEFAULT_RETENTION) {
  * module writes are returned — the same pattern retention prunes — so nothing
  * else in the directory can be listed or offered for download.
  */
-export function listArchives({ directory, network }) {
+export function listArchives({ directory, network, writes = null }) {
   const pattern = archivePattern(network);
   let names;
   try {
@@ -330,11 +453,37 @@ export function listArchives({ directory, network }) {
     .map((name) => {
       try {
         const stats = fs.statSync(path.join(directory, name));
+        // The name carries the time the attempt started, chosen before the
+        // first byte is written, and the file's last write is the finish — so
+        // how long the archive took is readable from what is already on disk,
+        // with no second record to keep in step. A name with no usable stamp
+        // (or a copy whose mtime is older than its name) has no duration.
+        const stamped = archiveTime(name, Number.NaN);
+        const hasStamp = !Number.isNaN(stamped.getTime());
+        // The schedule records both ends of every write it performs, and those
+        // are preferred: unlike the mtime they survive a copy. An archive from
+        // before that record existed, or one this node did not write, falls back
+        // to the name and the file's last write.
+        const recorded = writes?.[name] ?? null;
+        const startedMs = recorded ? Date.parse(recorded.startedAt) : Number.NaN;
+        const finishedMs = recorded ? Date.parse(recorded.finishedAt) : Number.NaN;
+        const fallbackMs = hasStamp ? stats.mtimeMs - stamped.getTime() : Number.NaN;
+        const writeMs = recorded
+          ? finishedMs - startedMs
+          : fallbackMs;
         return {
           name,
           bytes: stats.size,
           mtimeMs: stats.mtimeMs,
-          at: archiveTime(name, stats.mtimeMs).toISOString(),
+          at: (hasStamp ? stamped : new Date(stats.mtimeMs)).toISOString(),
+          startedAt: recorded?.startedAt ?? (hasStamp ? stamped.toISOString() : null),
+          finishedAt:
+            recorded?.finishedAt ??
+            (hasStamp ? new Date(stats.mtimeMs).toISOString() : null),
+          writeMs:
+            Number.isFinite(writeMs) && writeMs >= 0
+              ? Math.round(writeMs)
+              : null,
         };
       } catch {
         return null;
@@ -473,11 +622,15 @@ export function startBackupSchedule({
   intervalMs = DEFAULT_INTERVAL_MS,
   retention = DEFAULT_RETENTION,
   maxAgeMs = Math.max(intervalMs * DEFAULT_MAX_AGE_FACTOR, MIN_DEFAULT_MAX_AGE_MS),
+  maxLagBlocks = defaultMaxLagBlocks(params, intervalMs),
   firstDelayMs = Math.min(DEFAULT_FIRST_DELAY_MS, intervalMs),
   firstMaxWaitMs = DEFAULT_FIRST_MAX_WAIT_MS,
   recoveryHistoryLimit = DEFAULT_RECOVERY_HISTORY_LIMIT,
   verifyIntervalMs = DEFAULT_VERIFY_INTERVAL_MS,
   verifyTempRoot = os.tmpdir(),
+  // The chain height the newest archive is judged against. A scheduler has no
+  // chain of its own, so the node hands it a way to read the tip.
+  tipHeight = () => null,
   firstReady = () => true,
   readyPollMs = 1000,
   watchdogMs = DEFAULT_WATCHDOG_MS,
@@ -501,6 +654,9 @@ export function startBackupSchedule({
   if (!Number.isFinite(maxAgeMs) || maxAgeMs <= 0) {
     throw new Error('backup age limit must be a positive number of milliseconds');
   }
+  if (!Number.isInteger(maxLagBlocks) || maxLagBlocks < 1) {
+    throw new Error('backup lag limit must be a positive number of blocks');
+  }
   if (!Number.isInteger(recoveryHistoryLimit) || recoveryHistoryLimit < 1) {
     throw new Error('recovery history depth must be a positive integer');
   }
@@ -511,6 +667,9 @@ export function startBackupSchedule({
   }
   if (typeof verifyBackup !== 'function') {
     throw new Error('backup verifier must be a function');
+  }
+  if (typeof tipHeight !== 'function') {
+    throw new Error('backup lag check needs a way to read the chain height');
   }
   if (
     firstDelayMs !== null &&
@@ -541,6 +700,9 @@ export function startBackupSchedule({
     network: params.name,
   });
   let lastBackup = persisted?.lastBackup ?? null;
+  // Both ends of every write this node performed, keyed by archive name: the
+  // duration then survives a restart and a copy that moves the mtime.
+  let archiveWrites = readArchiveWrites(persisted?.archiveWrites);
   let recoveryHistory = (persisted?.recoveryHistory ?? []).slice(
     0,
     recoveryHistoryLimit,
@@ -554,6 +716,11 @@ export function startBackupSchedule({
   let stopped = false;
   let running = false;
   let nextRunAt = null;
+  // The wait the pending timer ends: when it began and how long it lasts. A
+  // recovered schedule keeps only the remainder, so these are not derivable
+  // from `nextRunAt` alone — the start is carried here instead.
+  let cycleStartedAt = null;
+  let cycleMs = null;
   let firstBackupPending = true;
   let waitingForSync = false;
   // When the readiness wait began: the first check that found sync unsettled.
@@ -563,6 +730,8 @@ export function startBackupSchedule({
   // One warning per stale episode, so a stalled schedule is not repeated on
   // every watchdog tick.
   let staleWarned = false;
+  // The same, for an archive that is recent but no longer at the tip.
+  let lagWarned = false;
   let verifying = false;
   let verifyTimer = null;
   // The archive that last failed verification. A corrupt file stays corrupt,
@@ -582,10 +751,12 @@ export function startBackupSchedule({
         firstMaxWaitMs,
         intervalMs,
         maxAgeMs,
+        maxLagBlocks,
         retention: retentionLimits,
         nextRunAt,
         waitingForSync,
         lastBackup,
+        archiveWrites,
         lastRecovery,
         recoveryHistory,
         recoveryHistoryLimit,
@@ -593,6 +764,19 @@ export function startBackupSchedule({
         lastError,
       },
       logError,
+    );
+  }
+
+  /**
+   * Record a recovery: the newest one plus a bounded history, newest first. It
+   * is persisted with the rest of the status, so a restarted node still shows
+   * what happened rather than starting from a blank page.
+   */
+  function noteRecovery(reason, at = now()) {
+    lastRecovery = { at: at.toISOString(), reason };
+    recoveryHistory = [lastRecovery, ...recoveryHistory].slice(
+      0,
+      recoveryHistoryLimit,
     );
   }
 
@@ -605,6 +789,14 @@ export function startBackupSchedule({
       : Number.NaN;
     const recoveredFromStale =
       Number.isFinite(previousAgeMs) && previousAgeMs > maxAgeMs;
+    // The chain can leave an archive behind even while it is young, so the run
+    // that replaces it ends that episode too. Measured against the archive being
+    // replaced, before the new one takes its place.
+    const previousLag = lagBehindTip();
+    const recoveredFromLag =
+      !recoveredFromStale &&
+      Number.isFinite(previousLag) &&
+      previousLag > maxLagBlocks;
     lastBackup = {
       at: lastAttemptAt,
       height: result.height,
@@ -619,23 +811,65 @@ export function startBackupSchedule({
     lastError = null;
     // A fresh archive ends any stale episode and re-arms the warning.
     staleWarned = false;
+    // The new archive sits at the tip, so whatever the gap was, this run closed
+    // it; the recovery line below is what says so when it had opened wide.
+    lagWarned = false;
+    // The recovery joins the history as well as the log: a node restarted after
+    // the fact should still be able to say the schedule came back. An archive
+    // opens an episode by getting old or by being left behind, and the age one
+    // speaks for both when the archive was old as well.
+    const recoveryReason = recoveredFromStale
+      ? `the previous archive was ${formatDuration(previousAgeMs)} old, past the ${formatDuration(maxAgeMs)} limit; fresh archives are being written again (height ${result.height})`
+      : recoveredFromLag
+        ? `the previous archive was ${previousLag} blocks behind the tip (limit ${maxLagBlocks}); fresh archives are being written again (height ${result.height})`
+        : null;
+    if (recoveryReason) {
+      noteRecovery(recoveryReason);
+    }
     const removed = pruneBackups({
       directory,
       network: params.name,
       retention: retentionLimits,
     });
+    // Record both ends of this write, and forget the archives pruning removed so
+    // the map follows what is actually on disk. `writtenAt` is the file's last
+    // write, taken as the run finished rather than read back later.
+    if (typeof result.writtenAt === 'string' && lastAttemptAt) {
+      archiveWrites[path.basename(result.path)] = {
+        startedAt: lastAttemptAt,
+        finishedAt: result.writtenAt,
+      };
+    }
+    for (const name of removed) {
+      delete archiveWrites[name];
+    }
+    trimArchiveWrites();
     persistStatus();
     log(
       `backup written: ${path.basename(result.path)} (height ${result.height}, ${result.bytes} bytes)${
         removed.length > 0 ? `; removed ${removed.length} old backup(s)` : ''
       }`,
     );
-    if (recoveredFromStale) {
-      log(
-        `backup schedule recovered: the previous archive was ${formatDuration(previousAgeMs)} old, past the ${formatDuration(maxAgeMs)} limit; fresh archives are being written again (height ${result.height})`,
-      );
+    if (recoveryReason) {
+      log(`backup schedule recovered: ${recoveryReason}`);
     }
     return result;
+  }
+
+  /** Keep the write records bounded; far more than retention can ever keep. */
+  function trimArchiveWrites() {
+    const names = Object.keys(archiveWrites);
+    if (names.length <= 200) {
+      return;
+    }
+    names.sort(
+      (left, right) =>
+        Date.parse(archiveWrites[left].finishedAt) -
+        Date.parse(archiveWrites[right].finishedAt),
+    );
+    for (const name of names.slice(0, names.length - 200)) {
+      delete archiveWrites[name];
+    }
   }
 
   function failRun(error) {
@@ -644,7 +878,70 @@ export function startBackupSchedule({
     throw error;
   }
 
-  function runNow() {
+  /**
+   * An explicit destination is an export, not a retention entry. It is written
+   * where asked and verified like any other archive, but left out of the
+   * schedule's bookkeeping: `lastBackup`, pruning and staleness must keep
+   * describing the directory this node manages. The path has to be absolute so
+   * it means the same thing whatever the node's working directory is, and it
+   * has to be outside that directory, where retention would neither recognise
+   * the name nor ever remove it.
+   */
+  function exportDestination(value) {
+    if (typeof value !== 'string' || value.trim() === '') {
+      throw new Error('an explicit backup destination must be a file path');
+    }
+    if (!path.isAbsolute(value)) {
+      throw new Error(`backup destination must be an absolute path: ${value}`);
+    }
+    const resolved = path.resolve(value);
+    const base = path.resolve(directory);
+    if (resolved === base || resolved.startsWith(`${base}${path.sep}`)) {
+      throw new Error(
+        `backup destination ${resolved} is inside the retention directory ${base}; choose a path outside it`,
+      );
+    }
+    return resolved;
+  }
+
+  /**
+   * Remove what a stopped run left behind and say so. A file the thread never
+   * finished verifying must not be mistaken for a backup someone could restore,
+   * so it is deleted rather than kept — including a truncated one from a write
+   * interrupted mid-file.
+   */
+  function finishCancelled(error, archivePath) {
+    const candidates = archivePath ? [archivePath, `${archivePath}.gz`] : [];
+    let discarded = null;
+    for (const candidate of candidates) {
+      try {
+        if (fs.existsSync(candidate)) {
+          fs.rmSync(candidate);
+          discarded = candidate;
+        }
+      } catch (removalError) {
+        logError(
+          `could not remove the cancelled archive ${candidate}: ${removalError.message}`,
+        );
+      }
+    }
+    log(
+      discarded
+        ? `backup cancelled: discarded ${discarded}`
+        : 'backup cancelled before an archive was written',
+    );
+    error.discarded = discarded;
+    return error;
+  }
+
+  function finishExport(result) {
+    log(
+      `backup exported: ${result.path} (height ${result.height}, ${result.bytes} bytes)`,
+    );
+    return result;
+  }
+
+  function runNow(options = {}) {
     if (stopped) {
       throw new Error('backup schedule is stopped');
     }
@@ -652,22 +949,37 @@ export function startBackupSchedule({
       throw new Error('a backup is already running');
     }
 
+    const exported =
+      options.destination !== undefined && options.destination !== null;
+    // Validated before `running` is set, so a rejected path leaves the schedule
+    // exactly as it was.
+    const target = exported ? exportDestination(options.destination) : null;
+
     running = true;
     const at = now();
-    lastAttemptAt = at.toISOString();
+    if (!exported) {
+      lastAttemptAt = at.toISOString();
+    }
+
+    const archivePath = target ?? nextPath(directory, params.name, at);
 
     let pending;
     try {
-      const destination = nextPath(directory, params.name, at);
       pending = runBackup({
         params,
         chainFile,
         walletFile,
-        destination,
+        destination: archivePath,
         passphrase,
+        // Forwarded to whatever writes the archive: the worker thread reports
+        // blocks written and re-verified, so a caller can show a percentage.
+        onProgress: options.onProgress,
       });
     } catch (error) {
       running = false;
+      if (exported) {
+        throw error;
+      }
       return failRun(error);
     }
 
@@ -677,24 +989,46 @@ export function startBackupSchedule({
       return pending.then(
         (result) => {
           running = false;
-          return finishRun(result);
+          return exported ? finishExport(result) : finishRun(result);
         },
         (error) => {
           running = false;
+          // A cancelled run is not a failed one: the operator stopped it, and
+          // its archive is removed rather than recorded or left on disk.
+          if (error?.cancelled) {
+            throw finishCancelled(error, archivePath);
+          }
+          if (exported) {
+            throw error;
+          }
           return failRun(error);
         },
       );
     }
 
     running = false;
-    return finishRun(pending);
+    return exported ? finishExport(pending) : finishRun(pending);
   }
 
-  function schedule(delay = intervalMs) {
+  /**
+   * Arm the next run. `span` is the whole wait this delay is the tail of: a
+   * fresh cycle passes the full delay, a re-armed one the interval it belongs
+   * to, so the schedule can report how far through the wait it is even though
+   * only the remainder was ever on its own timer. `span: null` means the timer
+   * is not a backup wait (the short polls while the first backup waits for
+   * peer sync) and there is no fraction to report.
+   */
+  function schedule(delay = intervalMs, span = delay) {
     if (stopped) {
       return;
     }
-    nextRunAt = new Date(now().getTime() + delay).toISOString();
+    const armedAt = now().getTime();
+    nextRunAt = new Date(armedAt + delay).toISOString();
+    cycleMs = Number.isFinite(span) && span > 0 ? span : null;
+    cycleStartedAt =
+      cycleMs === null
+        ? null
+        : armedAt - Math.max(0, Math.min(cycleMs, span - delay));
     timer = setTimeout(tick, delay);
     timer?.unref?.();
     persistStatus();
@@ -705,6 +1039,61 @@ export function startBackupSchedule({
    * first backup of this process there is nothing meaningful to compare: the
    * schedule may legitimately be waiting for sync or for its first delay.
    */
+  /** Blocks between the newest archive and the tip, or null when unknown. */
+  function lagBehindTip() {
+    if (!lastBackup) {
+      return null;
+    }
+    const height = tipHeight();
+    const archived = Number(lastBackup.height);
+    if (!Number.isFinite(height) || !Number.isFinite(archived)) {
+      return null;
+    }
+    return Math.max(0, height - archived);
+  }
+
+  /**
+   * Warn once when the newest archive falls further behind the tip than the
+   * configured limit. Age alone does not say whether a copy still represents the
+   * chain: a node that keeps mining drifts away from its last archive between
+   * runs, and the archive is the fallback if the node dies. The age warning takes
+   * precedence when both apply, since it says the schedule itself has stopped,
+   * and the all-clear is logged when the archive is back within the limit either
+   * way — a warning is never left as the last word.
+   */
+  function checkLag() {
+    if (stopped || !schedulingEnabled || running || firstBackupPending) {
+      return false;
+    }
+    const behind = lagBehindTip();
+    if (behind === null) {
+      return false;
+    }
+    const plural = (count) => `${count} block${count === 1 ? '' : 's'}`;
+
+    if (behind > maxLagBlocks) {
+      if (!lagWarned && !checkStaleness()) {
+        lagWarned = true;
+        logError(
+          `warning: the newest automatic backup is ${plural(
+            behind,
+          )} behind the tip (limit ${maxLagBlocks}); it is within the age limit but no longer represents the chain`,
+        );
+      }
+      return true;
+    }
+
+    if (lagWarned) {
+      lagWarned = false;
+      log(
+        `backup lag cleared: the newest automatic backup is ${plural(
+          behind,
+        )} behind the tip, within the ${plural(maxLagBlocks)} limit`,
+      );
+    }
+    return false;
+  }
+
   function checkStaleness() {
     if (stopped || !schedulingEnabled || running || firstBackupPending) {
       return false;
@@ -809,6 +1198,7 @@ export function startBackupSchedule({
       return false;
     }
     checkStaleness();
+    checkLag();
     if (nextRunAt && timer) {
       return false;
     }
@@ -830,12 +1220,10 @@ export function startBackupSchedule({
     const reason = `${
       hadNextRun ? 'timer was missing' : 'next run was missing'
     }${catchingUp ? '; archive overdue, catching up now' : ''}`;
-    lastRecovery = { at: recoveredAt.toISOString(), reason };
-    recoveryHistory = [lastRecovery, ...recoveryHistory].slice(
-      0,
-      recoveryHistoryLimit,
-    );
-    schedule(delay);
+    noteRecovery(reason, recoveredAt);
+    // The remainder is the tail of a full wait, so the progress reported below
+    // matches a schedule whose timer never went missing.
+    schedule(delay, firstBackupPending ? firstDelayMs : intervalMs);
     log(`Automatic backup schedule re-armed (${reason}): ${nextRunAt}`);
     return true;
   }
@@ -860,7 +1248,8 @@ export function startBackupSchedule({
         const waitedMs = now().getTime() - firstWaitStartedAt;
         if (firstMaxWaitMs === 0 || waitedMs < firstMaxWaitMs) {
           waitingForSync = true;
-          schedule(readyPollMs);
+          // A poll, not a wait for the archive: there is no cycle to measure.
+          schedule(readyPollMs, null);
           return;
         }
         // A peer that never answers must not hold the first archive hostage:
@@ -935,10 +1324,31 @@ export function startBackupSchedule({
         firstMaxWaitMs,
         intervalMs,
         maxAgeMs,
+        maxLagBlocks,
         retention: retentionLimits,
         statusFile: statusPath,
         verifyIntervalMs,
         nextRunAt,
+        // Progress through the current wait, 0–1, as the schedule itself sees
+        // it: measured from when this cycle began (which a recovery or a
+        // restored next run can place well before this process started) rather
+        // than re-derived from the remaining time and a guessed interval. Null
+        // while the first backup waits for peer sync, while a run is in
+        // flight, and whenever no run is scheduled.
+        elapsedFraction:
+          !nextRunAt ||
+          waitingForSync ||
+          running ||
+          cycleMs === null ||
+          cycleStartedAt === null
+            ? null
+            : Math.round(
+                Math.min(
+                  1,
+                  Math.max(0, (now().getTime() - cycleStartedAt) / cycleMs),
+                ) * 1000,
+              ) / 1000,
+        cycleMs,
         running,
         verifying,
         waitingForSync,
@@ -965,6 +1375,9 @@ export function startBackupSchedule({
     stop() {
       stopped = true;
       nextRunAt = null;
+      // No wait is pending, so there is no fraction to report either.
+      cycleStartedAt = null;
+      cycleMs = null;
       waitingForSync = false;
       if (timer) {
         clearTimeout(timer);

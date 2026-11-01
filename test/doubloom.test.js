@@ -44,6 +44,8 @@ import {
   backupStatusFile,
   backupRecoveryDelayMs,
   backupFileName,
+  defaultMaxLagBlocks,
+  listArchives,
   normalizeRetention,
   pruneBackups,
   retentionAssignments,
@@ -88,6 +90,40 @@ function readNodeArchive(file) {
 
 function writeNodeArchive(file, value) {
   fs.writeFileSync(file, zlib.gzipSync(Buffer.from(JSON.stringify(value))));
+}
+
+/**
+ * Grow a chain far enough that a backup is slow enough to interrupt. Mining by
+ * wall clock would make difficulty climb after every retarget; the benchmark's
+ * gap pattern holds it at the genesis floor, which is what makes a few thousand
+ * blocks affordable here.
+ */
+function mineSteadyBlocks(chain, address, count) {
+  const gaps = steadyGaps(chain.params);
+  let nextTime = chain.params.genesisTime;
+  for (let index = 0; index < count; index += 1) {
+    const block = chain.buildBlock(address);
+    nextTime += gaps[chain.height % gaps.length];
+    block.header.time = nextTime;
+    mineHeader(block.header);
+    chain.addBlock(block);
+  }
+}
+
+/**
+ * A node whose chain is long enough that a backup takes seconds rather than
+ * milliseconds, which is what makes stopping one observable at all.
+ */
+function stoppableNode(passphrase) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'doubloom-cancel-'));
+  const chainFile = path.join(dir, 'data', devnet.name, 'chain.json');
+  const walletFile = path.join(dir, 'data', devnet.name, 'wallet.json');
+  const wallet = Wallet.create(walletFile, devnet);
+  const chain = Chain.create(devnet);
+  mineSteadyBlocks(chain, wallet.defaultKey().address, 2_500);
+  wallet.encrypt(passphrase);
+  saveChain(chain, chainFile);
+  return { dir, chainFile, walletFile, chain, wallet };
 }
 
 function fundedChain(blockCount = 101) {
@@ -2365,6 +2401,385 @@ test('a stale schedule logs a recovery line once a fresh archive is written', as
   }
 });
 
+test('a stale-to-fresh recovery is kept in the persisted recovery history', async () => {
+  const passphrase = 'stale history passphrase';
+  const { dir, chainFile, walletFile, wallet } = temporaryNode();
+  wallet.encrypt(passphrase);
+  const statusFile = backupStatusFile(chainFile);
+  const logs = [];
+  let clockOffset = 0;
+  const options = {
+    params: devnet,
+    chainFile,
+    walletFile,
+    directory: path.join(dir, 'backups'),
+    passphrase,
+    intervalMs: 60_000,
+    firstDelayMs: 0,
+    maxAgeMs: 1_000,
+    retention: { hourly: 2, daily: 0, weekly: 0 },
+    now: () => new Date(Date.now() + clockOffset),
+    log: (message) => logs.push(message),
+    logError: () => {},
+  };
+  const schedule = startBackupSchedule(options);
+  let restarted = null;
+
+  try {
+    await schedule.runNow();
+    assert.equal(
+      schedule.status().recoveryHistory.length,
+      0,
+      'a fresh run is not a recovery',
+    );
+
+    // The archive ages past the limit, so the next run replaces a stale one.
+    clockOffset = 5_000;
+    await schedule.runNow();
+    const status = schedule.status();
+    assert.equal(status.recoveryHistory.length, 1);
+    assert.match(
+      status.recoveryHistory[0].reason,
+      /^the previous archive was [\d.]+s old, past the 1s limit; fresh archives are being written again \(height \d+\)$/,
+    );
+    assert.deepEqual(status.recoveryHistory[0], status.lastRecovery);
+    assert.match(
+      logs.join('\n'),
+      /backup schedule recovered: the previous archive was [\d.]+s old/,
+    );
+
+    // It is on disk with the rest of the status...
+    const persisted = loadBackupStatus({ statusFile, network: devnet.name });
+    assert.deepEqual(persisted.recoveryHistory, status.recoveryHistory);
+    assert.deepEqual(persisted.lastRecovery, status.lastRecovery);
+    schedule.stop();
+
+    // ...so a node that starts later still reports it, even though this
+    // process never saw the stale archive itself.
+    restarted = startBackupSchedule({ ...options, firstDelayMs: 60_000 });
+    assert.deepEqual(restarted.status().recoveryHistory, status.recoveryHistory);
+    assert.deepEqual(restarted.status().lastRecovery, status.lastRecovery);
+  } finally {
+    restarted?.stop();
+    schedule.stop();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a manual backup can be exported outside the retention directory', async () => {
+  const passphrase = 'export passphrase';
+  const { dir, chainFile, walletFile, chain, wallet } = temporaryNode();
+  wallet.encrypt(passphrase);
+  const backupDir = path.join(dir, 'backups');
+  const schedule = startBackupSchedule({
+    params: devnet,
+    chainFile,
+    walletFile,
+    directory: backupDir,
+    passphrase,
+    intervalMs: 60_000,
+    retention: { hourly: 2, daily: 0, weekly: 0 },
+    firstDelayMs: 600_000,
+    log: () => {},
+    logError: () => {},
+  });
+
+  try {
+    const target = path.join(dir, 'usb', 'node-snapshot.json');
+    const result = await schedule.runNow({ destination: target });
+
+    // The suffix is added exactly as it is for an archive in the directory.
+    assert.equal(result.path, `${target}.gz`);
+    assert.ok(fs.existsSync(result.path));
+    assert.equal(result.height, chain.height);
+
+    // A copy that restores is the only export worth having.
+    const restored = restoreNodeBackup({
+      source: result.path,
+      params: devnet,
+      chainFile: path.join(dir, 'restored', 'chain.json'),
+      walletFile: path.join(dir, 'restored', 'wallet.json'),
+      passphrase,
+    });
+    assert.equal(restored.height, chain.height);
+
+    // It is not a retention entry: the directory is untouched and the schedule
+    // still reports no backup of its own.
+    assert.deepEqual(
+      fs.existsSync(backupDir) ? fs.readdirSync(backupDir) : [],
+      [],
+    );
+    assert.equal(schedule.status().lastBackup, null);
+    assert.equal(schedule.status().lastAttemptAt, null);
+
+    // A path that cannot mean "outside this directory" is refused before a run
+    // starts, so the schedule is left able to try again.
+    assert.throws(
+      () => schedule.runNow({ destination: 'relative.json' }),
+      /absolute path/,
+    );
+    assert.throws(
+      () =>
+        schedule.runNow({ destination: path.join(backupDir, 'inside.json') }),
+      /inside the retention directory/,
+    );
+    assert.equal(schedule.status().running, false);
+
+    const ordinary = await schedule.runNow();
+    assert.equal(path.dirname(ordinary.path), path.resolve(backupDir));
+    assert.equal(schedule.status().lastBackup.height, chain.height);
+  } finally {
+    schedule.stop();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a backup reports how much of its chain is written and verified', () => {
+  const passphrase = 'progress passphrase';
+  const { dir, chainFile, walletFile, chain, wallet } = temporaryNode();
+  wallet.encrypt(passphrase);
+  const seen = [];
+
+  try {
+    const result = createNodeBackup({
+      params: devnet,
+      chainFile,
+      walletFile,
+      destination: path.join(dir, 'progress', 'archive.json'),
+      passphrase,
+      onProgress: (progress) => seen.push({ ...progress }),
+    });
+
+    assert.ok(result.bytes > 0);
+    // The chunked write produces exactly the archive one `JSON.stringify` would
+    // have: parsing and re-serializing it changes nothing.
+    const text = zlib.gunzipSync(fs.readFileSync(result.path)).toString('utf8');
+    assert.equal(JSON.stringify(JSON.parse(text)), text);
+    assert.ok(seen.length >= 3, `several reports: ${JSON.stringify(seen)}`);
+    assert.equal(seen[0].phase, 'writing');
+    assert.equal(seen[0].percent, 0);
+    assert.equal(seen[0].total, chain.height + 1);
+    assert.equal(seen[seen.length - 1].phase, 'verifying');
+    assert.equal(seen[seen.length - 1].percent, 100);
+    assert.equal(seen[seen.length - 1].done, chain.height + 1);
+    assert.ok(
+      seen.some(
+        (progress) => progress.phase === 'verifying' && progress.percent >= 50,
+      ),
+      'verification starts from the half-way mark',
+    );
+
+    // The figure only moves forward, stays inside the bar, and never counts
+    // more blocks than the chain holds.
+    for (let index = 1; index < seen.length; index += 1) {
+      assert.ok(seen[index].percent >= seen[index - 1].percent);
+      assert.ok(seen[index].done <= seen[index].total);
+    }
+    for (const progress of seen) {
+      assert.ok(progress.percent >= 0 && progress.percent <= 100);
+    }
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('backup progress crosses the worker thread to its caller', async () => {
+  const passphrase = 'worker progress passphrase';
+  const { dir, chainFile, walletFile, chain, wallet } = temporaryNode();
+  wallet.encrypt(passphrase);
+  const worker = createBackupWorker();
+  const schedule = startBackupSchedule({
+    params: devnet,
+    chainFile,
+    walletFile,
+    directory: path.join(dir, 'backups'),
+    passphrase,
+    intervalMs: 60_000,
+    firstDelayMs: 600_000,
+    runBackup: (job) => worker.runBackup(job),
+    log: () => {},
+    logError: () => {},
+  });
+  const seen = [];
+
+  try {
+    await schedule.runNow({ onProgress: (progress) => seen.push({ ...progress }) });
+    assert.ok(seen.length >= 2, `progress arrives from the thread: ${seen.length}`);
+    assert.equal(seen[0].phase, 'writing');
+    assert.equal(seen[seen.length - 1].percent, 100);
+    assert.equal(seen[seen.length - 1].total, chain.height + 1);
+  } finally {
+    schedule.stop();
+    worker.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('cancelling the backup worker leaves it able to run again', async () => {
+  const passphrase = 'worker cancel passphrase';
+  const { dir, chainFile, walletFile, chain, wallet } = stoppableNode(passphrase);
+  const worker = createBackupWorker();
+
+  try {
+    const pending = worker.runBackup({
+      params: devnet,
+      chainFile,
+      walletFile,
+      destination: path.join(dir, 'run', 'cancel-me.json'),
+      passphrase,
+    });
+    // The thread is already working: the archive takes seconds on this chain.
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.equal(worker.cancelRunning(), true);
+
+    const error = await pending.then(
+      () => null,
+      (reason) => reason,
+    );
+    assert.ok(error, 'the cancelled job rejects rather than resolving');
+    assert.equal(error.cancelled, true);
+    assert.equal(worker.cancelRunning(), false, 'nothing is running any more');
+
+    // The thread is replaced rather than left dead: the next job still works.
+    const result = await worker.runBackup({
+      params: devnet,
+      chainFile,
+      walletFile,
+      destination: path.join(dir, 'run', 'after.json'),
+      passphrase,
+    });
+    assert.ok(fs.existsSync(result.path));
+    assert.equal(result.height, chain.height);
+  } finally {
+    worker.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a running backup can be cancelled and its archive discarded', async () => {
+  const { startNode } = await import('../src/node.js');
+  const passphrase = 'cancel passphrase';
+  const { dir, chainFile, walletFile, chain, wallet } = stoppableNode(passphrase);
+  const backupDir = path.join(dir, 'backups');
+
+  const logs = [];
+  const originalLog = console.log;
+  const originalError = console.error;
+  console.log = (...args) => logs.push(args.join(' '));
+  console.error = (...args) => logs.push(args.join(' '));
+
+  let node = null;
+  const listening = async (instance) => {
+    const deadline = Date.now() + 3000;
+    while (!instance.server.address() && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    return `http://127.0.0.1:${instance.server.address().port}`;
+  };
+  const jobOf = async (url, id) =>
+    (await (await fetch(`${url}/api/backup/jobs/${id}`)).json()).job;
+
+  try {
+    node = startNode({
+      chain,
+      params: devnet,
+      chainFile,
+      walletFile,
+      wallet,
+      port: 0,
+      backup: {
+        directory: backupDir,
+        passphrase,
+        intervalMs: 60 * 60_000,
+        firstDelayMs: 60 * 60_000,
+      },
+    });
+    const url = await listening(node);
+
+    const created = await (await fetch(`${url}/api/backup`, { method: 'POST' })).json();
+    assert.equal(created.job.state, 'running');
+
+    // Cancel while the archive is being re-verified: the file exists by then, so
+    // stopping has something to throw away.
+    let job = created.job;
+    const deadline = Date.now() + 10_000;
+    while (Date.now() < deadline) {
+      job = await jobOf(url, created.job.id);
+      if (job.progress?.phase === 'verifying') {
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(
+      job.progress?.phase,
+      'verifying',
+      `the run reached verification: ${JSON.stringify(job.progress)}`,
+    );
+
+    const response = await fetch(`${url}/api/backup/jobs/${created.job.id}`, {
+      method: 'DELETE',
+    });
+    assert.equal(response.status, 200);
+    const body = await response.json();
+    assert.equal(body.job.state, 'cancelled');
+    assert.equal(body.job.error, null);
+    assert.match(body.job.discarded, /\.json\.gz$/);
+    assert.ok(!fs.existsSync(body.job.discarded), 'the archive is gone');
+    assert.equal(body.status.lastBackup, null, 'a cancelled run is not a backup');
+    assert.deepEqual(
+      fs.existsSync(backupDir) ? fs.readdirSync(backupDir) : [],
+      [],
+      'nothing is left in the retention directory',
+    );
+    assert.ok(
+      logs.some((line) => line.includes('backup cancelled: discarded')),
+      'the log names what was thrown away',
+    );
+
+    // The verdict sticks, and stopping it again is a conflict, not a new event.
+    assert.equal((await jobOf(url, created.job.id)).state, 'cancelled');
+    const again = await fetch(`${url}/api/backup/jobs/${created.job.id}`, {
+      method: 'DELETE',
+    });
+    assert.equal(again.status, 409);
+
+    // The node is not left unable to back up.
+    const next = await (await fetch(`${url}/api/backup`, { method: 'POST' })).json();
+    let finished = next.job;
+    const settleBy = Date.now() + 30_000;
+    while (finished.state === 'running' && Date.now() < settleBy) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      finished = await jobOf(url, next.job.id);
+    }
+    assert.equal(finished.state, 'succeeded');
+    assert.ok(fs.existsSync(finished.backup.path));
+  } finally {
+    if (node) {
+      await node.close();
+    }
+    console.log = originalLog;
+    console.error = originalError;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('the explorer offers to cancel a running backup', () => {
+  const explorer = fs.readFileSync(
+    new URL('../src/explorer.html', import.meta.url),
+    'utf8',
+  );
+  assert.match(explorer, /id="backup-cancel"[^>]*hidden/);
+  assert.match(explorer, /method: "DELETE"/);
+  assert.match(
+    explorer,
+    /\/api\/backup\/jobs\/\$\{encodeURIComponent\(id\)\}/,
+  );
+  // Cancelling says what happened to the archive, using what the node reported.
+  assert.match(explorer, /finished\.discarded/);
+  assert.match(explorer, /Backup cancelled · discarded/);
+  assert.match(explorer, /No archive|no archive was written/);
+});
+
 test('a stale automatic backup is warned about once per episode', async () => {
   const passphrase = 'stale backup passphrase';
   const { dir, chainFile, walletFile, wallet } = temporaryNode();
@@ -3336,6 +3751,520 @@ test('a zero first-backup wait cap keeps waiting for peer sync', async () => {
     );
   } finally {
     schedule.stop();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('the block-lag limit defaults, persists and rejects nonsense', () => {
+  const { dir, chainFile, walletFile } = temporaryNode();
+  const statusFile = backupStatusFile(chainFile);
+  const open = (overrides = {}) =>
+    startBackupSchedule({
+      params: devnet,
+      chainFile,
+      walletFile,
+      directory: path.join(dir, 'backups'),
+      passphrase: 'not used for scheduling',
+      intervalMs: 60_000,
+      firstDelayMs: 60_000,
+      log: () => {},
+      logError: () => {},
+      ...overrides,
+    });
+
+  let schedule = open();
+  try {
+    // The default is one interval's worth of blocks, so a faster schedule is
+    // judged proportionally: six at Bitcoin's ten-minute spacing, sixty on a
+    // network whose blocks come every minute.
+    assert.equal(defaultMaxLagBlocks(networkParams('mainnet'), 3_600_000), 6);
+    assert.equal(defaultMaxLagBlocks(devnet, 3_600_000), 60);
+    assert.equal(defaultMaxLagBlocks(devnet, 600_000), 10);
+    // An interval shorter than one block still gets a limit of one, never zero.
+    assert.equal(defaultMaxLagBlocks(devnet, 1_000), 1);
+    assert.equal(defaultMaxLagBlocks(undefined, 3_600_000), 1);
+
+    schedule = open({ intervalMs: 10 * 60_000 });
+    assert.equal(schedule.status().maxLagBlocks, 10);
+    schedule.stop();
+
+    schedule = open({ maxLagBlocks: 2 });
+    assert.equal(schedule.status().maxLagBlocks, 2);
+    // Persisted, so `backup status` reports the limit of the node that wrote the
+    // schedule even after it exits.
+    assert.equal(
+      loadBackupStatus({ statusFile, network: devnet.name }).maxLagBlocks,
+      2,
+    );
+    schedule.stop();
+
+    // A file from a node that predates the setting has no figure to report.
+    const older = JSON.parse(fs.readFileSync(statusFile, 'utf8'));
+    delete older.maxLagBlocks;
+    fs.writeFileSync(statusFile, JSON.stringify(older));
+    assert.equal(
+      loadBackupStatus({ statusFile, network: devnet.name }).maxLagBlocks,
+      null,
+    );
+
+    for (const bad of [0, -1, 1.5, Number.NaN]) {
+      assert.throws(
+        () => open({ maxLagBlocks: bad }),
+        /backup lag limit must be a positive number of blocks/,
+      );
+    }
+  } finally {
+    schedule?.stop();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('archive write times are recorded and outrank the file mtime', async () => {
+  const passphrase = 'write times passphrase';
+  const { dir, chainFile, walletFile, wallet } = temporaryNode();
+  wallet.encrypt(passphrase);
+  const backupDir = path.join(dir, 'backups');
+  const statusFile = backupStatusFile(chainFile);
+  const schedule = startBackupSchedule({
+    params: devnet,
+    chainFile,
+    walletFile,
+    directory: backupDir,
+    passphrase,
+    intervalMs: 3_600_000,
+    firstDelayMs: 3_600_000,
+    retention: { hourly: 2, daily: 0, weekly: 0 },
+    log: () => {},
+    logError: () => {},
+  });
+
+  try {
+    const first = await schedule.runNow();
+    const firstName = path.basename(first.path);
+    let persisted = loadBackupStatus({ statusFile, network: devnet.name });
+    const record = persisted.archiveWrites[firstName];
+    assert.ok(record, 'the write is recorded by archive name');
+    // The attempt is the time the run started, which is also what the archive
+    // is dated by; the finish is the file's last write.
+    assert.equal(record.startedAt, persisted.lastBackup.at);
+    assert.ok(
+      Date.parse(record.finishedAt) >= Date.parse(record.startedAt),
+      'the finish follows the attempt',
+    );
+    const recordedMs = Date.parse(record.finishedAt) - Date.parse(record.startedAt);
+
+    // Moving the mtime changes nothing once the write is recorded: a copy or a
+    // restore can move it, the run itself cannot.
+    fs.utimesSync(
+      first.path,
+      new Date(),
+      new Date(Date.parse(record.finishedAt) + 10_000),
+    );
+    const withRecord = listArchives({
+      directory: backupDir,
+      network: devnet.name,
+      writes: persisted.archiveWrites,
+    });
+    assert.equal(withRecord[0].writeMs, Math.round(recordedMs));
+    assert.equal(withRecord[0].startedAt, record.startedAt);
+    assert.equal(withRecord[0].finishedAt, record.finishedAt);
+    // Without the record the mtime is all there is, which is the fallback.
+    const fallback = listArchives({ directory: backupDir, network: devnet.name });
+    assert.ok(
+      fallback[0].writeMs >= Math.round(recordedMs) + 9_000,
+      'the fallback follows the shifted mtime',
+    );
+
+    // Retention keeps one archive per hour, so the second run prunes the first —
+    // and its record goes with it rather than describing a file that is gone.
+    const second = await schedule.runNow();
+    persisted = loadBackupStatus({ statusFile, network: devnet.name });
+    assert.equal(persisted.archiveWrites[firstName], undefined);
+    assert.ok(persisted.archiveWrites[path.basename(second.path)]);
+  } finally {
+    schedule.stop();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('the schedule warns when the newest archive falls behind the tip', async () => {
+  const passphrase = 'lag warning passphrase';
+  const { dir, chainFile, walletFile, wallet, chain } = temporaryNode();
+  wallet.encrypt(passphrase);
+  const logs = [];
+  const errors = [];
+  let tip = chain.height;
+  let clockOffset = 0;
+  const schedule = startBackupSchedule({
+    params: devnet,
+    chainFile,
+    walletFile,
+    directory: path.join(dir, 'backups'),
+    passphrase,
+    intervalMs: 3_600_000,
+    firstDelayMs: 0,
+    maxAgeMs: 1_200_000,
+    maxLagBlocks: 2,
+    watchdogMs: 15,
+    // The scheduler has no chain, so the tip comes from its owner.
+    tipHeight: () => tip,
+    now: () => new Date(Date.now() + clockOffset),
+    log: (message) => logs.push(message),
+    logError: (message) => errors.push(message),
+  });
+
+  const waitUntil = async (check, timeoutMs = 4000) => {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (check()) {
+        return true;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    return false;
+  };
+  const lagWarnings = () =>
+    errors.filter((line) =>
+      line.startsWith('warning: the newest automatic backup is'),
+    );
+
+  try {
+    assert.ok(
+      await waitUntil(() => logs.some((line) => line.startsWith('backup written'))),
+      'the first backup ran',
+    );
+    const archived = schedule.status().lastBackup.height;
+
+    // At the limit is still fine; nothing is said about two blocks.
+    tip = archived + 2;
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    assert.equal(lagWarnings().length, 0);
+
+    // Past it, the warning names the gap and the configured limit, once.
+    tip = archived + 3;
+    assert.ok(await waitUntil(() => lagWarnings().length > 0), 'the lag warning appeared');
+    assert.match(
+      lagWarnings()[0],
+      /^warning: the newest automatic backup is 3 blocks behind the tip \(limit 2\); it is within the age limit but no longer represents the chain$/,
+    );
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    assert.equal(lagWarnings().length, 1, 'one warning per episode');
+
+    // Back within the limit, the all-clear says where it stands.
+    tip = archived + 1;
+    assert.ok(
+      await waitUntil(() => logs.some((line) => line.startsWith('backup lag cleared'))),
+      'the all-clear was logged',
+    );
+    assert.match(
+      logs.find((line) => line.startsWith('backup lag cleared')),
+      /is 1 block behind the tip, within the 2 blocks limit$/,
+    );
+
+    // A stale archive is the age warning's business: it already says the
+    // schedule stopped, so the gap is not reported again on top of it.
+    clockOffset = 40 * 60_000;
+    tip = archived + 10;
+    assert.ok(
+      await waitUntil(() => errors.some((line) => line.includes('past the'))),
+      'the age warning appeared',
+    );
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    assert.equal(lagWarnings().length, 1, 'no lag warning beside the age warning');
+  } finally {
+    schedule.stop();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a run that replaces a lagging archive logs a recovery', async () => {
+  const passphrase = 'lag recovery passphrase';
+  const { dir, chainFile, walletFile, wallet, chain } = temporaryNode();
+  wallet.encrypt(passphrase);
+  const logs = [];
+  const errors = [];
+  const schedule = startBackupSchedule({
+    params: devnet,
+    chainFile,
+    walletFile,
+    directory: path.join(dir, 'backups'),
+    passphrase,
+    intervalMs: 3_600_000,
+    firstDelayMs: 0,
+    maxAgeMs: 1_200_000,
+    maxLagBlocks: 2,
+    watchdogMs: 15,
+    tipHeight: () => chain.height,
+    log: (message) => logs.push(message),
+    logError: (message) => errors.push(message),
+  });
+
+  const waitUntil = async (check, timeoutMs = 4000) => {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (check()) {
+        return true;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    return false;
+  };
+
+  try {
+    // The zero first delay means the schedule writes its own first archive; a
+    // manual run before that leaves the readiness gate closed.
+    assert.ok(
+      await waitUntil(() => logs.some((line) => line.startsWith('backup written'))),
+      'the first backup ran',
+    );
+    // Grow the chain past the limit, so the archive on disk is left behind.
+    for (let index = 0; index < 3; index += 1) {
+      const block = chain.buildBlock(wallet.defaultKey().address);
+      mineHeader(block.header);
+      chain.addBlock(block);
+    }
+    // The schedule backs up the chain file, so the new tip has to be on disk.
+    saveChain(chain, chainFile);
+    assert.ok(
+      await waitUntil(() =>
+        errors.some((line) => line.includes('behind the tip (limit 2)')),
+      ),
+      'the warning came first',
+    );
+
+    // The run that replaces it ends the episode and says so, in the same shape
+    // as an archive that had merely gone old.
+    const fresh = await schedule.runNow();
+    const recovered = logs.find((line) =>
+      line.startsWith('backup schedule recovered:'),
+    );
+    assert.ok(recovered, `expected a recovery line, got: ${logs.join(' | ')}`);
+    assert.match(
+      recovered,
+      /^backup schedule recovered: the previous archive was 3 blocks behind the tip \(limit 2\); fresh archives are being written again \(height \d+\)$/,
+    );
+    assert.equal(fresh.height, chain.height);
+
+    // The same sentence is in the persisted history, so it survives a restart.
+    const status = schedule.status();
+    assert.equal(status.recoveryHistory.length, 1);
+    assert.equal(
+      status.recoveryHistory[0].reason,
+      recovered.replace('backup schedule recovered: ', ''),
+    );
+    const persisted = loadBackupStatus({
+      statusFile: backupStatusFile(chainFile),
+      network: devnet.name,
+    });
+    assert.deepEqual(persisted.recoveryHistory, status.recoveryHistory);
+
+    // The recovery replaces the bare all-clear, and the warning is not repeated
+    // now that the archive is back at the tip.
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    assert.equal(
+      logs.filter((line) => line.startsWith('backup lag cleared')).length,
+      0,
+      'the recovery line is the all-clear for this episode',
+    );
+    assert.equal(
+      errors.filter((line) =>
+        line.startsWith('warning: the newest automatic backup is'),
+      ).length,
+      1,
+      'one warning for the episode',
+    );
+  } finally {
+    schedule.stop();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a node warns in its log when its archive falls behind the tip', async () => {
+  const { startNode } = await import('../src/node.js');
+  const passphrase = 'node lag passphrase';
+  const { dir, chainFile, walletFile, chain, wallet } = temporaryNode();
+  wallet.encrypt(passphrase);
+
+  const logs = [];
+  const errors = [];
+  const originalLog = console.log;
+  const originalError = console.error;
+  console.log = (...args) => {
+    logs.push(args.join(' '));
+  };
+  console.error = (...args) => {
+    errors.push(args.join(' '));
+  };
+  let node = null;
+
+  try {
+    node = startNode({
+      chain,
+      params: devnet,
+      chainFile,
+      walletFile,
+      wallet,
+      port: 0,
+      backup: {
+        directory: path.join(dir, 'backups'),
+        passphrase,
+        intervalMs: 3_600_000,
+        firstDelayMs: 0,
+        maxLagBlocks: 2,
+        retention: { hourly: 2, daily: 0, weekly: 0 },
+      },
+    });
+    const deadline = Date.now() + 5000;
+    while (!node.server.address() && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    while (
+      !logs.some((line) => line.startsWith('backup written')) &&
+      Date.now() < deadline + 5000
+    ) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+
+    // Mine past the limit without waiting for the next scheduled run.
+    for (let index = 0; index < 3; index += 1) {
+      const block = chain.buildBlock(wallet.defaultKey().address);
+      mineHeader(block.header);
+      chain.addBlock(block);
+    }
+
+    // The node's watchdog runs every ten seconds, so allow it one pass.
+    const warned = Date.now() + 15_000;
+    while (
+      !errors.some((line) => line.includes('behind the tip')) &&
+      Date.now() < warned
+    ) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    assert.ok(
+      errors.some((line) =>
+        line.includes('behind the tip (limit 2); it is within the age limit'),
+      ),
+      `expected a lag warning, got: ${errors.join(' | ')}`,
+    );
+  } finally {
+    console.log = originalLog;
+    console.error = originalError;
+    if (node) {
+      await node.close();
+    }
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('the node rejects a bad block-lag limit', async () => {
+  const passphrase = 'lag flag passphrase';
+  const { dir, wallet } = temporaryNode();
+  wallet.encrypt(passphrase);
+  const cliPath = fileURLToPath(new URL('../src/cli.js', import.meta.url));
+  const run = (...args) =>
+    promisify(execFile)(
+      process.execPath,
+      [
+        cliPath,
+        '--network',
+        'devnet',
+        '--datadir',
+        path.join(dir, 'data'),
+        'node',
+        '--backup-dir',
+        path.join(dir, 'backups'),
+        ...args,
+      ],
+      {
+        timeout: 20_000,
+        env: { ...process.env, DOUBLOOM_PASSPHRASE: passphrase },
+      },
+    );
+
+  try {
+    await assert.rejects(
+      run('--backup-max-lag', '0'),
+      /--backup-max-lag must be a positive whole number of blocks/,
+    );
+    await assert.rejects(
+      run('--backup-max-lag', '2.5'),
+      /--backup-max-lag must be a positive whole number of blocks/,
+    );
+    await assert.rejects(
+      run('--backup-max-lag'),
+      /--backup-max-lag requires a number of blocks/,
+    );
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('the configured lag limit reaches the startup log and backup status', async () => {
+  const { startNode } = await import('../src/node.js');
+  const passphrase = 'lag report passphrase';
+  const { dir, chainFile, walletFile, chain, wallet } = temporaryNode();
+  wallet.encrypt(passphrase);
+  const dataDir = path.join(dir, 'data');
+  const cliPath = fileURLToPath(new URL('../src/cli.js', import.meta.url));
+
+  const logs = [];
+  const originalLog = console.log;
+  console.log = (...args) => {
+    logs.push(args.join(' '));
+  };
+  let node = null;
+
+  const run = (...args) =>
+    promisify(execFile)(
+      process.execPath,
+      [cliPath, '--network', 'devnet', '--datadir', dataDir, ...args],
+      { timeout: 20_000 },
+    ).then((result) => result.stdout.replace(/\u001b\[[0-9;]*m/g, ''));
+
+  try {
+    node = startNode({
+      chain,
+      params: devnet,
+      chainFile,
+      walletFile,
+      wallet,
+      port: 0,
+      backup: {
+        directory: path.join(dir, 'backups'),
+        passphrase,
+        intervalMs: 600_000,
+        firstDelayMs: 60_000,
+        // Two blocks: a stricter limit than the default six.
+        maxLagBlocks: 2,
+        retention: { hourly: 2, daily: 0, weekly: 0 },
+      },
+    });
+    const deadline = Date.now() + 3000;
+    while (!node.server.address() && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+
+    // The startup line lists it beside the age limit it belongs with.
+    assert.match(
+      logs.join('\n'),
+      /Automatic backups: .*max age 20 min, lag 2 blocks/,
+    );
+
+    console.log = () => {};
+    const text = await run('backup', 'status');
+    assert.match(
+      text,
+      /schedule\s+every 10 min · keep hourly 2 · recoveries 5 · max age 20 min · lag 2 blocks/,
+    );
+
+    // And the script-friendly record carries the number, not the sentence.
+    const payload = JSON.parse(await run('backup', 'status', '--json'));
+    assert.equal(payload.maxLagBlocks, 2);
+  } finally {
+    if (node) {
+      await node.close();
+    }
+    console.log = originalLog;
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
@@ -5738,6 +6667,12 @@ test('a manual backup answers with a job that can be polled to completion', asyn
     assert.equal(job.backup.height, chain.height);
     assert.equal(job.backup.tip, headerHash(chain.tip.header));
     assert.ok(fs.existsSync(job.backup.path));
+    // The node reports how far through the chain it got, and a finished run
+    // has written and re-verified all of it.
+    assert.equal(job.progress.percent, 100);
+    assert.equal(job.progress.phase, 'verifying');
+    assert.equal(job.progress.total, chain.height + 1);
+    assert.equal(job.progress.done, job.progress.total);
 
     // The status response carries the newest job, so a reloaded page can resume
     // following the run it started instead of launching a duplicate.
@@ -5841,6 +6776,14 @@ test('the backup panel shows the archive size beside its height', () => {
   assert.match(explorer, /const savedPercent =\s*\n?\s*Number\.isFinite\(last\.rawBytes\) && last\.rawBytes > last\.bytes/);
   assert.match(explorer, /` · saved \$\{savedPercent\}%`/);
   assert.match(explorer, /, \$\{savedPercent\}% smaller\)/);
+  // Both figures sit in the row when the node recorded the uncompressed size:
+  // the compressed one alone does not say what the archive holds.
+  assert.match(explorer, /` · \$\{fileSize\(last\.bytes\)\} gz · \$\{fileSize\(last\.rawBytes\)\} raw`/);
+  assert.match(explorer, /const hasRaw =\s*\n?\s*Number\.isFinite\(last\.rawBytes\) && last\.rawBytes > last\.bytes/);
+  // The key count recorded with the archive rides along in the tooltip.
+  assert.match(explorer, /const keyText = Number\.isFinite\(last\.keys\)/);
+  assert.match(explorer, /key\$\{last\.keys === 1 \? "" : "s"\}/);
+  assert.match(explorer, /\}\$\{keyText\}`/);
 });
 
 test('the newest archive is restored to a temporary directory when verified', async () => {
@@ -6026,10 +6969,20 @@ test('the backup panel flags an archive that is many blocks behind the tip', () 
     new URL('../src/explorer.html', import.meta.url),
     'utf8',
   );
-  assert.match(explorer, /const BACKUP_LAG_BLOCKS = 6;/);
-  assert.match(explorer, /behind > BACKUP_LAG_BLOCKS/);
+  // The limit comes from the node, so a node started with --backup-max-lag is
+  // judged by its own figure; six is only the fallback for a node that does not
+  // report one.
+  assert.match(explorer, /const DEFAULT_MAX_LAG_BLOCKS = 6;/);
+  assert.match(explorer, /const lagBlocks = Number\.isInteger\(backup\.maxLagBlocks\)/);
+  assert.match(explorer, /behind > lagBlocks/);
   assert.match(explorer, /label = "behind tip";/);
-  assert.match(explorer, /blocks behind the tip \(limit/);
+  assert.match(explorer, /blocks behind the tip \(limit \$\{lagBlocks\}\)/);
+  // The configured limit is on show beside the rest of the schedule.
+  assert.match(
+    explorer,
+    /lag \$\{formatNumber\(backup\.maxLagBlocks\)\} block\$\{/,
+  );
+  assert.match(explorer, /backup\.maxLagBlocks === 1 \? "" : "s"/);
   // Age is still checked first, so an overdue archive reads as overdue; the lag
   // rule covers the archive that is recent but no longer represents the chain.
   assert.ok(
@@ -6041,6 +6994,101 @@ test('the backup panel flags an archive that is many blocks behind the tip', () 
   assert.match(explorer, /behind tip`/);
 });
 
+test('the node reports how far through the current backup wait it is', async () => {
+  const passphrase = 'fraction passphrase';
+  const { dir, chainFile, walletFile, wallet } = temporaryNode();
+  wallet.encrypt(passphrase);
+  const realSetTimeout = globalThis.setTimeout;
+  const callbacks = [];
+  // A fixed, shiftable clock, and a timer that is captured instead of being
+  // scheduled, so a wait can be advanced without waiting for it to elapse.
+  const start = Date.UTC(2026, 9, 31, 12, 0, 0);
+  let clock = start;
+  let schedule;
+
+  try {
+    globalThis.setTimeout = (callback) => {
+      callbacks.push(callback);
+      return null;
+    };
+    schedule = startBackupSchedule({
+      params: devnet,
+      chainFile,
+      walletFile,
+      directory: path.join(dir, 'backups'),
+      passphrase,
+      intervalMs: 60_000,
+      firstDelayMs: 0,
+      retention: { hourly: 2, daily: 0, weekly: 0 },
+      watchdogMs: 20,
+      now: () => new Date(clock),
+      log: () => {},
+      logError: () => {},
+    });
+
+    // The first delay is zero, so the first run fires at once and the interval
+    // that follows starts there: no time has elapsed yet.
+    callbacks.shift()();
+    let status = schedule.status();
+    assert.equal(status.cycleMs, 60_000);
+    assert.equal(status.elapsedFraction, 0);
+
+    clock += 15_000;
+    assert.equal(schedule.status().elapsedFraction, 0.25);
+
+    // A manual archive does not restart the wait, so progress keeps climbing
+    // toward the run that was already scheduled instead of dropping to zero —
+    // which is what a page guessing from the interval would have shown.
+    await schedule.runNow();
+    assert.equal(schedule.status().elapsedFraction, 0.25);
+    assert.equal(schedule.status().cycleMs, 60_000);
+
+    // The watchdog re-arms a schedule whose timer went missing. Only the
+    // remainder is armed, yet the fraction still describes the whole wait: the
+    // newest archive is 30s old of a 60s interval.
+    clock += 30_000;
+    assert.equal(schedule.ensureScheduled(), true);
+    status = schedule.status();
+    assert.equal(status.cycleMs, 60_000);
+    assert.equal(status.elapsedFraction, 0.5);
+    assert.equal(Date.parse(status.nextRunAt), start + 75_000);
+
+    // Nothing is pending once the schedule is stopped, so there is no fraction
+    // to report rather than a stale one.
+    schedule.stop();
+    assert.equal(schedule.status().elapsedFraction, null);
+    assert.equal(schedule.status().cycleMs, null);
+
+    // While the first backup waits for peer sync the timer only polls, so a
+    // fraction of "the wait" would be meaningless and is reported as null.
+    callbacks.length = 0;
+    schedule = startBackupSchedule({
+      params: devnet,
+      chainFile,
+      walletFile,
+      directory: path.join(dir, 'backups'),
+      passphrase,
+      intervalMs: 60_000,
+      firstDelayMs: 0,
+      firstReady: () => false,
+      readyPollMs: 20,
+      retention: { hourly: 2, daily: 0, weekly: 0 },
+      watchdogMs: 20,
+      now: () => new Date(clock),
+      log: () => {},
+      logError: () => {},
+    });
+    callbacks.shift()();
+    assert.equal(schedule.status().waitingForSync, true);
+    assert.equal(schedule.status().elapsedFraction, null);
+    assert.equal(schedule.status().cycleMs, null);
+  } finally {
+    globalThis.setTimeout = realSetTimeout;
+    schedule?.stop();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('the explorer draws a progress ring around the next backup countdown', () => {
   const explorer = fs.readFileSync(
     new URL('../src/explorer.html', import.meta.url),
@@ -6049,18 +7097,48 @@ test('the explorer draws a progress ring around the next backup countdown', () =
   assert.match(explorer, /class="countdown-ring" id="next-ring"/);
   assert.match(explorer, /id="next-ring-fill"/);
   assert.match(explorer, /\.countdown-ring \.ring-fill/);
-  // The ring is a fraction of the wait: the elapsed part of the first delay or
-  // of the interval, whichever is governing this run.
+  // The ring draws the fraction the node reports for the wait it is actually
+  // running, and only advances it by the time since that figure arrived — the
+  // page no longer works out where in an interval it is.
   assert.match(explorer, /const RING_CIRCUMFERENCE = 2 \* Math\.PI \* 9;/);
-  assert.match(explorer, /1 - remaining \/ backupCycleMs/);
-  assert.match(explorer, /backupCycleMs = Number\.isFinite\(span\)/);
-  // It is hidden rather than empty when there is no next run, or while the
-  // first backup is still waiting for the initial sync.
+  assert.match(explorer, /backupElapsedFraction = Number\.isFinite\(backup\?\.elapsedFraction\)/);
+  assert.match(explorer, /backupElapsedFraction \+\s*Math\.max\(0, Date\.now\(\) - backupElapsedAt\) \/ backupCycleMs/);
+  assert.match(explorer, /backupCycleMs =\s*Number\.isFinite\(backup\?\.cycleMs\) && backup\.cycleMs > 0/);
+  assert.equal(
+    /remaining \/ backupCycleMs/.test(explorer),
+    false,
+    'the page must not infer the fraction from the countdown',
+  );
+  // It is hidden rather than empty when there is no next run, when the node
+  // reports no fraction, or while the first backup is still waiting for sync.
+  assert.match(explorer, /backupElapsedFraction === null/);
   assert.match(explorer, /!Number\.isFinite\(backupCycleMs\)/);
   assert.match(explorer, /ring\.toggleAttribute\("hidden", true\)/);
   // SVG elements ignore the `hidden` IDL property, so the attribute is what
   // the stylesheet keys off.
   assert.match(explorer, /ring\.toggleAttribute\("hidden", false\)/);
+});
+
+test('the explorer phrases the next backup countdown the way the terminal does', () => {
+  const explorer = fs.readFileSync(
+    new URL('../src/explorer.html', import.meta.url),
+    'utf8',
+  );
+  // Clock time first, countdown parenthesised after it: the same sentence
+  // `doubloom info` and `doubloom backup status` build for the same run.
+  assert.match(explorer, /target\.textContent = `\$\{utcTime\(nextBackupAt\)\} \(\$\{/);
+  assert.match(explorer, /formatCountdown\(remaining\)/);
+  assert.match(explorer, /\}\)\$\{firstDelay\}\$\{firstWait\}`/);
+  // The trailing hints come from the same fields info prints.
+  assert.match(explorer, /first delay \$\{duration\(backupFirstDelayMs\)\}/);
+  assert.match(explorer, /sync wait cap \$\{duration\(backupFirstMaxWaitMs\)\}/);
+  assert.match(
+    explorer,
+    /backupFirstMaxWaitMs = Number\.isFinite\(backup\?\.firstMaxWaitMs\)/,
+  );
+  // A first backup held by peer sync keeps its waited time inside the same
+  // parentheses, where the terminal only says `waiting for sync`.
+  assert.match(explorer, /`waiting for sync\$\{/);
 });
 
 test('the explorer polls a backup job instead of blocking on the request', () => {
@@ -6075,6 +7153,8 @@ test('the explorer polls a backup job instead of blocking on the request', () =>
   assert.match(explorer, /job\.state !== "running"/);
   assert.match(explorer, /finished\.backup\?\.height/);
   assert.match(explorer, /response\.status === 409 && started\.job\?\.state === "running"/);
+  // The percentage the node reports is shown beside the elapsed wait.
+  assert.match(explorer, /job\.progress\?\.percent/);
 });
 
 test('info and backup status count down to the next automatic backup', async () => {
@@ -6184,6 +7264,260 @@ test('backup status says how long ago the last archive was taken', async () => {
       stdout,
       /last archive\s+\d{4}-\d\d-\d\d \d\d:\d\d:\d\d UTC \(1m \d+s ago\) · height 3 · 1,472 bytes/,
     );
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('each archive reports how long it took to write', () => {
+  const { dir } = temporaryNode();
+  const backupDir = path.join(dir, 'backups');
+  fs.mkdirSync(backupDir, { recursive: true });
+
+  // The name carries the time the attempt started; the last write is the
+  // finish. Both are already on disk, so the duration needs no extra record.
+  const attempt = new Date('2026-10-31T12:00:00.000Z');
+  const slow = backupFileName(devnet.name, attempt);
+  const fast = backupFileName(devnet.name, new Date(attempt.getTime() + 60_000));
+  fs.writeFileSync(path.join(backupDir, slow), Buffer.alloc(10));
+  fs.writeFileSync(path.join(backupDir, fast), Buffer.alloc(10));
+  fs.utimesSync(
+    path.join(backupDir, slow),
+    new Date(),
+    new Date(attempt.getTime() + 2_500),
+  );
+  fs.utimesSync(
+    path.join(backupDir, fast),
+    new Date(),
+    new Date(attempt.getTime() + 60_250),
+  );
+
+  try {
+    const archives = listArchives({ directory: backupDir, network: devnet.name });
+    const byName = new Map(archives.map((archive) => [archive.name, archive]));
+    assert.equal(byName.get(slow).writeMs, 2_500);
+    assert.equal(byName.get(fast).writeMs, 250);
+    // The attempt time is still what the archive is dated by.
+    assert.equal(byName.get(slow).at, attempt.toISOString());
+
+    // A copy whose mtime predates its name cannot have taken a negative time to
+    // write, so it reports no duration rather than a nonsense one.
+    fs.utimesSync(
+      path.join(backupDir, fast),
+      new Date(),
+      new Date(attempt.getTime() + 59_000),
+    );
+    const copied = listArchives({ directory: backupDir, network: devnet.name })
+      .find((archive) => archive.name === fast);
+    assert.equal(copied.writeMs, null);
+    assert.equal(copied.at, new Date(attempt.getTime() + 60_000).toISOString());
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('backup status reports how long each retained archive took to write', async () => {
+  const { dir, chainFile } = temporaryNode();
+  const dataDir = path.join(dir, 'data');
+  const cliPath = fileURLToPath(new URL('../src/cli.js', import.meta.url));
+  const statusFile = backupStatusFile(chainFile);
+  const backupDir = path.join(dir, 'backups');
+  fs.mkdirSync(backupDir, { recursive: true });
+
+  // Three retained archives, one per hour so the hourly tier keeps all three:
+  // one written in under a second, one written in three quarters of a minute,
+  // and one whose mtime says nothing usable.
+  const now = Date.now();
+  const attempts = [
+    new Date(now - 2 * 3_600_000 - 600_000),
+    new Date(now - 3_600_000 - 300_000),
+    new Date(now - 60_000),
+  ];
+  const writes = [1_800, 45_000, -5_000];
+  const names = attempts.map((attempt) => backupFileName(devnet.name, attempt));
+  names.forEach((name, index) => {
+    fs.writeFileSync(path.join(backupDir, name), Buffer.alloc(1_200));
+    fs.utimesSync(
+      path.join(backupDir, name),
+      new Date(),
+      new Date(attempts[index].getTime() + writes[index]),
+    );
+  });
+
+  fs.mkdirSync(path.dirname(statusFile), { recursive: true });
+  fs.writeFileSync(
+    statusFile,
+    JSON.stringify({
+      version: 1,
+      network: devnet.name,
+      pid: process.pid,
+      directory: backupDir,
+      intervalMs: 600_000,
+      firstDelayMs: 60_000,
+      maxAgeMs: 1_500_000,
+      retention: { hourly: 3, daily: 0, weekly: 0 },
+      recoveryHistoryLimit: 3,
+      nextRunAt: null,
+      waitingForSync: false,
+      lastAttemptAt: null,
+      lastError: null,
+      lastBackup: {
+        at: attempts[2].toISOString(),
+        height: 3,
+        path: path.join(backupDir, names[2]),
+        bytes: 1_200,
+      },
+      lastRecovery: null,
+      recoveryHistory: [],
+      // The schedule records both ends of its own writes; these outrank the
+      // mtimes below, which a copy could have moved.
+      archiveWrites: {
+        [names[1]]: {
+          startedAt: attempts[1].toISOString(),
+          finishedAt: new Date(attempts[1].getTime() + 7_000).toISOString(),
+        },
+        // A half-written record is ignored rather than trusted.
+        [names[0]]: { startedAt: attempts[0].toISOString() },
+      },
+    }),
+  );
+
+  const run = (...args) =>
+    promisify(execFile)(
+      process.execPath,
+      [
+        cliPath,
+        '--network',
+        'devnet',
+        '--datadir',
+        dataDir,
+        'backup',
+        'status',
+        ...args,
+      ],
+      { timeout: 20_000 },
+    ).then((result) => result.stdout.replace(/\u001b\[[0-9;]*m/g, ''));
+
+  try {
+    const stdout = await run();
+    // `backup status` prints UTC to the second, unlike `backup list`.
+    const stamp = (date) =>
+      date.toISOString().slice(0, 19).replace('T', ' ');
+    const line = (index) =>
+      stdout
+        .split('\n')
+        .find(
+          (entry) =>
+            entry.includes('retained') && entry.includes(stamp(attempts[index])),
+        );
+
+    // Sub-second writes keep their milliseconds; longer ones read in seconds.
+    // The middle archive's mtime says 45s but its record says 7s, and the record
+    // is the one that describes the run; the first archive's record is
+    // incomplete, so its mtime is used instead of a partial pair.
+    assert.match(line(0), /1\.2 KiB · wrote in 1\.8s/);
+    assert.match(line(1), /1\.2 KiB · wrote in 7\.0s/);
+    assert.match(line(2), /1\.2 KiB · write time not recorded/);
+    // Newest first, like every other archive listing.
+    assert.ok(
+      stdout.indexOf(stamp(attempts[1])) < stdout.indexOf(stamp(attempts[0])),
+      'retained archives are listed newest first',
+    );
+
+    // The same figures are in the script-friendly record.
+    const payload = JSON.parse(await run('--json'));
+    assert.equal(payload.archives.length, 3);
+    assert.deepEqual(
+      payload.archives.map((archive) => archive.name),
+      [names[2], names[1], names[0]],
+    );
+    assert.deepEqual(
+      payload.archives.map((archive) => archive.writeMs),
+      [null, 7_000, 1_800],
+    );
+    assert.equal(payload.archives[0].at, attempts[2].toISOString());
+    assert.equal(payload.archives[0].bytes, 1_200);
+    // The two ends are reported beside the duration, so a script does not have
+    // to subtract it from the archive time to place the write.
+    assert.deepEqual(payload.archives[1].startedAt, attempts[1].toISOString());
+    assert.equal(
+      payload.archives[1].finishedAt,
+      new Date(attempts[1].getTime() + 7_000).toISOString(),
+    );
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('backup status shows the archive raw size and key count', async () => {
+  const { dir, chainFile } = temporaryNode();
+  const dataDir = path.join(dir, 'data');
+  const cliPath = fileURLToPath(new URL('../src/cli.js', import.meta.url));
+  const statusFile = backupStatusFile(chainFile);
+  const path_ = path.join(dir, 'backups', 'a.json.gz');
+
+  const writeStatus = (lastBackup) => {
+    fs.mkdirSync(path.dirname(statusFile), { recursive: true });
+    fs.writeFileSync(
+      statusFile,
+      JSON.stringify({
+        version: 1,
+        network: devnet.name,
+        pid: process.pid,
+        directory: path.join(dir, 'backups'),
+        intervalMs: 600_000,
+        firstDelayMs: 60_000,
+        nextRunAt: new Date(Date.now() + 60_000).toISOString(),
+        lastBackup,
+      }),
+    );
+  };
+
+  const run = () =>
+    promisify(execFile)(
+      process.execPath,
+      [cliPath, '--network', 'devnet', '--datadir', dataDir, 'backup', 'status'],
+      { timeout: 20_000 },
+    ).then((result) => result.stdout.replace(/\u001b\[[0-9;]*m/g, ''));
+
+  try {
+    // Both sizes, the saving between them, and how many keys the archive holds.
+    writeStatus({
+      at: new Date(Date.now() - 60_000).toISOString(),
+      height: 3,
+      path: path_,
+      bytes: 1_481,
+      rawBytes: 5_669,
+      keys: 2,
+    });
+    const full = await run();
+    assert.match(
+      full,
+      /last archive\s+\d{4}-\d\d-\d\d \d\d:\d\d:\d\d UTC \(1m(?: \d+s)? ago\) · height 3 · 1,481 bytes gzipped \(from 5,669 raw, 74% smaller\) · 2 keys/,
+    );
+
+    // One key reads as a key, not as keys.
+    writeStatus({
+      at: new Date(Date.now() - 60_000).toISOString(),
+      height: 3,
+      path: path_,
+      bytes: 1_481,
+      rawBytes: 5_669,
+      keys: 1,
+    });
+    assert.match(await run(), /74% smaller\) · 1 key$/m);
+
+    // A status file written before these fields existed still prints its size,
+    // without inventing a raw figure or a key count.
+    writeStatus({
+      at: new Date(Date.now() - 60_000).toISOString(),
+      height: 3,
+      path: path_,
+      bytes: 1_481,
+    });
+    const older = await run();
+    assert.match(older, /height 3 · 1,481 bytes$/m);
+    assert.equal(/raw|key/.test(older), false);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
@@ -6354,6 +7688,122 @@ test('backup list shows each archive with its size and retention tier', async ()
   }
 });
 
+test('backup status --json reports a computed verdict', async () => {
+  const { dir, chainFile, chain } = temporaryNode();
+  const dataDir = path.join(dir, 'data');
+  const cliPath = fileURLToPath(new URL('../src/cli.js', import.meta.url));
+  const statusFile = backupStatusFile(chainFile);
+  const backupDir = path.join(dir, 'backups');
+  fs.mkdirSync(backupDir, { recursive: true });
+  const now = Date.now();
+  const iso = (offsetMs) => new Date(now + offsetMs).toISOString();
+
+  const write = (overrides) => {
+    fs.mkdirSync(path.dirname(statusFile), { recursive: true });
+    fs.writeFileSync(
+      statusFile,
+      JSON.stringify({
+        version: 1,
+        network: devnet.name,
+        pid: process.pid,
+        directory: backupDir,
+        intervalMs: 600_000,
+        firstDelayMs: 60_000,
+        maxAgeMs: 1_200_000,
+        maxLagBlocks: 5,
+        retention: { hourly: 2, daily: 0, weekly: 0 },
+        ...overrides,
+      }),
+    );
+  };
+  const archive = (overrides = {}) => ({
+    at: iso(-60_000),
+    height: chain.height,
+    tip: 'ab'.repeat(32),
+    path: path.join(backupDir, 'a.json.gz'),
+    bytes: 1_200,
+    ...overrides,
+  });
+
+  const read = async () => {
+    const stdout = (
+      await promisify(execFile)(
+        process.execPath,
+        [cliPath, '--network', 'devnet', '--datadir', dataDir, 'backup', 'status', '--json'],
+        { timeout: 20_000 },
+      )
+    ).stdout;
+    return JSON.parse(stdout);
+  };
+
+  try {
+    // No schedule recorded at all is not the same as a broken one.
+    const unconfigured = await read();
+    assert.equal(unconfigured.verdict, 'unknown');
+    assert.equal(unconfigured.lastArchiveAgeMs, null, 'no archive, no age');
+    assert.equal(unconfigured.maxArchiveAgeMs, null, 'no schedule, no limit');
+    // The chain on disk is what the lag rule measures against, so a script can
+    // reproduce the comparison without a node.
+    assert.equal(unconfigured.tipHeight, chain.height);
+
+    // A schedule that has not written its first archive yet.
+    write({ lastBackup: null });
+    assert.equal((await read()).verdict, 'waiting');
+
+    // Fresh and at the tip. The age is reported in milliseconds, measured from
+    // the same instant the verdict was reached, so a script needs no clock of
+    // its own; the archive above is a minute old.
+    write({ lastBackup: archive() });
+    const fresh = await read();
+    assert.equal(fresh.verdict, 'healthy');
+    assert.ok(
+      fresh.lastArchiveAgeMs >= 59_000 && fresh.lastArchiveAgeMs < 120_000,
+      `a one-minute-old archive reports its age (${fresh.lastArchiveAgeMs})`,
+    );
+    assert.equal(fresh.maxArchiveAgeMs, 1_200_000);
+
+    // Older than the age limit reads `stale`, the word the panel's `overdue`
+    // stands for, and the reported age is past the reported limit.
+    write({ lastBackup: archive({ at: iso(-40 * 60_000) }) });
+    const stale = await read();
+    assert.equal(stale.verdict, 'stale');
+    assert.ok(
+      stale.lastArchiveAgeMs >= 2_400_000,
+      `the age crosses the limit (${stale.lastArchiveAgeMs})`,
+    );
+    assert.ok(stale.lastArchiveAgeMs > stale.maxArchiveAgeMs);
+
+    // With no recorded limit, the effective one is twice the interval — the
+    // same fallback the verdict applied, so the pair stays comparable.
+    write({ maxAgeMs: null, lastBackup: archive({ at: iso(-40 * 60_000) }) });
+    const derived = await read();
+    assert.equal(derived.maxAgeMs, null);
+    assert.equal(derived.maxArchiveAgeMs, 1_200_000, '2 × the 10 minute interval');
+    assert.equal(derived.verdict, 'stale');
+
+    // Within the age limit but further behind the tip than the lag limit.
+    write({ lastBackup: archive({ height: chain.height - 6 }) });
+    assert.equal((await read()).verdict, 'behind');
+
+    // An attempt that failed after the archive was written is reported as such
+    // rather than as a stale archive.
+    write({
+      lastBackup: archive({ at: iso(-40 * 60_000) }),
+      lastAttemptAt: iso(-10_000),
+      lastError: 'disk full',
+    });
+    assert.equal((await read()).verdict, 'failed');
+
+    // Age outranks lag when both apply, as the panel orders them.
+    write({
+      lastBackup: archive({ at: iso(-40 * 60_000), height: chain.height - 6 }),
+    });
+    assert.equal((await read()).verdict, 'stale');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('backup status --json prints the record for scripts', async () => {
   const { dir, chainFile } = temporaryNode();
   const dataDir = path.join(dir, 'data');
@@ -6430,6 +7880,44 @@ test('backup status --json prints the record for scripts', async () => {
     assert.match(text, /Automatic backups/);
     assert.match(text, /last archive/);
     assert.ok(!text.trimStart().startsWith('{'), 'no JSON without the flag');
+
+    // Attempts and recoveries read as ages too, not only as stamps, so the
+    // panel answers "how long ago" without the reader doing the subtraction.
+    // Written relative to now so the expected wording cannot drift.
+    const recent = new Date(
+      Date.now() - (3 * 3600 + 30 * 60) * 1000,
+    ).toISOString();
+    const older = new Date(
+      Date.now() - (2 * 24 * 3600 + 3600) * 1000,
+    ).toISOString();
+    const withAges = JSON.parse(fs.readFileSync(statusFile, 'utf8'));
+    withAges.lastAttemptAt = recent;
+    withAges.lastRecovery = { at: recent, reason: 'timer was overdue' };
+    withAges.recoveryHistory = [
+      { at: recent, reason: 'timer was overdue' },
+      { at: older, reason: 'timer was missing' },
+    ];
+    fs.writeFileSync(statusFile, JSON.stringify(withAges));
+
+    // Both rows read `<utc stamp> (<age>) · <reason>`: the stamp stays exact and
+    // the age sits beside it, the same shape the last archive row uses. The
+    // age is dimmed, so match against the text with its colour codes removed.
+    const aged = (await run()).replace(/\x1b\[[0-9;]*m/g, '');
+    assert.match(
+      aged,
+      /last attempt\s+\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} UTC \(3h 30m ago\)/,
+      'the attempt carries how long ago it was',
+    );
+    assert.match(
+      aged,
+      /last recovery\s+\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} UTC \(3h 30m ago\) · timer was overdue/,
+      'the newest recovery carries its age beside its reason',
+    );
+    assert.match(
+      aged,
+      /earlier\s+\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} UTC \(2d 1h ago\) · timer was missing/,
+      'retained recoveries carry ages too',
+    );
 
     // A failed run must report its error verbatim, with when it was attempted,
     // while the schedule itself stays readable — a script polling the error
@@ -6676,6 +8164,41 @@ test('the backup now command drives an immediate backup on a running node', asyn
       'the second backup is a new archive',
     );
 
+    // An explicit destination writes an export outside the retention directory
+    // and leaves the schedule's own bookkeeping alone.
+    const archiveCount = (await status()).archives.length;
+    const exportPath = path.join(dir, 'exports', 'node-snapshot.json');
+    const exported = await run('--port', String(port), '--to', exportPath);
+    assert.match(exported.stdout, /Backup written and verified on the node/);
+    assert.ok(
+      fs.existsSync(`${exportPath}.gz`),
+      'the archive landed where it was asked',
+    );
+    assert.ok(exported.stdout.includes(`${exportPath}.gz`));
+    assert.match(
+      exported.stdout,
+      /outside the node's backup directory, where retention/,
+      'the footer says this copy is not managed by retention',
+    );
+    assert.ok(
+      exported.stdout.includes(headerHash(chain.tip.header)),
+      'the export names the tip it archived',
+    );
+    const afterExport = await status();
+    assert.equal(
+      afterExport.lastBackup.path,
+      afterRecorded.lastBackup.path,
+      'an export does not replace the recorded backup',
+    );
+    assert.equal(afterExport.archives.length, archiveCount);
+
+    // A destination the node would have to manage as part of retention is
+    // refused, and the reason names both paths.
+    const inside = path.join(backupDir, 'inside.json');
+    const refusedExport = await failure(['--port', String(port), '--to', inside]);
+    assert.ok(refusedExport, 'a path inside the backup directory is refused');
+    assert.match(refusedExport.stderr, /inside the retention directory/);
+
     // A node without --backup-dir cannot back up, and says how to fix it.
     await node.close();
     node = null;
@@ -6707,6 +8230,111 @@ test('the backup now command drives an immediate backup on a running node', asyn
       await bare.close();
     }
     console.log = originalLog;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('backup now reports elapsed time while the node verifies', async () => {
+  const dir = fs.mkdtempSync(
+    path.join(os.tmpdir(), 'doubloom-backup-progress-'),
+  );
+  const cliPath = fileURLToPath(new URL('../src/cli.js', import.meta.url));
+  const archive = {
+    path: path.join(
+      dir,
+      'backups',
+      'doubloom-devnet-backup-20261031-000000000.json.gz',
+    ),
+    bytes: 1_468,
+    rawBytes: 3_878,
+    height: 3,
+    tip: 'a'.repeat(64),
+    keys: 1,
+  };
+
+  let polls = 0;
+  let runningUntil = null;
+  const server = http.createServer((request, response) => {
+    const { pathname } = new URL(request.url, 'http://127.0.0.1');
+    const send = (status, payload) => {
+      response.writeHead(status, { 'content-type': 'application/json' });
+      response.end(JSON.stringify(payload));
+    };
+    if (pathname === '/api/backup' && request.method === 'POST') {
+      send(202, { ok: true, job: { id: 'job-1', state: 'running' } });
+      return;
+    }
+    if (pathname === '/api/backup/jobs/job-1') {
+      polls += 1;
+      // Held open longer than the five seconds a piped run reports on, timed
+      // from the first poll so CLI start-up cannot eat the interval.
+      runningUntil ??= Date.now() + 5_600;
+      if (Date.now() < runningUntil) {
+        send(200, {
+          job: {
+            id: 'job-1',
+            state: 'running',
+            progress: {
+              phase: 'verifying',
+              done: 750,
+              total: 1_000,
+              percent: 75,
+            },
+          },
+        });
+        return;
+      }
+      send(200, {
+        job: {
+          id: 'job-1',
+          state: 'succeeded',
+          finishedAt: new Date().toISOString(),
+          backup: { ...archive, at: new Date().toISOString() },
+        },
+      });
+      return;
+    }
+    if (pathname === '/api/backup') {
+      send(200, { enabled: true, nextRunAt: null });
+      return;
+    }
+    send(404, { error: 'not found' });
+  });
+
+  try {
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const port = server.address().port;
+    const result = await promisify(execFile)(
+      process.execPath,
+      [
+        cliPath,
+        '--network',
+        'devnet',
+        '--datadir',
+        dir,
+        'backup',
+        'now',
+        '--port',
+        String(port),
+      ],
+      { timeout: 30_000 },
+    );
+
+    const waited = result.stdout
+      .split('\n')
+      .filter((line) => line.includes('waiting for the node'));
+    assert.ok(waited.length > 0, `the wait is reported: ${result.stdout}`);
+    // The percentage the node reports is on the same line as the clock.
+    assert.match(
+      waited[0],
+      /waiting for the node · 75% verified \([\d,]+\/[\d,]+ blocks\) · \d+s/,
+    );
+    // The report still follows once the job finishes, unchanged.
+    assert.match(result.stdout, /Backup written and verified on the node/);
+    assert.ok(result.stdout.includes(archive.path));
+    assert.ok(polls > 1, 'the job was polled while it ran');
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });

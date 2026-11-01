@@ -355,7 +355,7 @@ function rangedChain(ranges) {
  * set and transaction index. Nothing is joined into a new array: each range is
  * walked where it already sits.
  */
-export function replayRanges(params, ranges) {
+export function replayRanges(params, ranges, onBlock) {
   const chain = rangedChain(ranges);
   if (chain.length === 0) {
     throw new ValidationError('chain is empty');
@@ -371,25 +371,30 @@ export function replayRanges(params, ranges) {
   const utxos = new Map();
   const txIndex = new Map();
   applyBlockAt(chain, 0, utxos, txIndex);
+  // Optional per-block hook, for callers that have to show how much of a chain
+  // they have got through (a backup verifying its own archive). It observes
+  // only; nothing about validation depends on it.
+  onBlock?.(1);
 
   for (let height = 1; height < chain.length; height += 1) {
     validateBlockAt(chain, height, utxos, params, txIndex);
     applyBlockAt(chain, height, utxos, txIndex);
+    onBlock?.(height + 1);
   }
 
   return { utxos, txIndex };
 }
 
 /** Verify a whole chain from genesis and rebuild its UTXO set. */
-export function replayChain(params, blocks) {
+export function replayChain(params, blocks, onBlock) {
   if (!Array.isArray(blocks) || blocks.length === 0) {
     throw new ValidationError('chain is empty');
   }
-  return replayRanges(params, [{ blocks }]);
+  return replayRanges(params, [{ blocks }], onBlock);
 }
 
 export class Chain {
-  constructor(params, blocks) {
+  constructor(params, blocks, onBlock) {
     this.params = params;
     this.blocks = blocks;
     this.mempool = new Map();
@@ -402,7 +407,7 @@ export class Chain {
     // `doubloom info`, so it is kept beside the blocks too. The same three
     // places keep it honest: addBlock, adopt and applyExtension.
     this.cachedSupply = supplyAtHeight(params, blocks.length - 1);
-    const { utxos, txIndex } = replayChain(params, blocks);
+    const { utxos, txIndex } = replayChain(params, blocks, onBlock);
     this.utxos = utxos;
     this.txIndex = txIndex;
   }

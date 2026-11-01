@@ -20,6 +20,14 @@ import { headerHash } from './block.js';
 export const NODE_BACKUP_FORMAT = 'doubloom-node-backup';
 export const NODE_BACKUP_VERSION = 1;
 
+/**
+ * How many blocks one progress step covers. Writing and verifying are both
+ * per-block, so a caller can say how far through the chain it is; reporting
+ * every block would post a message per block on a long chain for a bar that
+ * only moves a fraction of a percent.
+ */
+const PROGRESS_BLOCKS = 250;
+
 function readArchive(source) {
   if (!fs.existsSync(source)) {
     throw new Error(`no backup at ${source}`);
@@ -78,7 +86,7 @@ function verifyArchivedWallet(params, walletData, passphrase) {
   }
 }
 
-function verifyArchive(params, archive, passphrase) {
+function verifyArchive(params, archive, passphrase, onBlock) {
   if (!archive || typeof archive !== 'object') {
     throw new Error('backup is empty or not an object');
   }
@@ -110,7 +118,7 @@ function verifyArchive(params, archive, passphrase) {
 
   // The Chain constructor replays every block: proof of work, merkle roots,
   // transaction signatures, subsidies and the UTXO set are all checked here.
-  const chain = new Chain(params, archive.chain.blocks);
+  const chain = new Chain(params, archive.chain.blocks, onBlock);
   const wallet = verifyArchivedWallet(params, archive.wallet, passphrase);
 
   const height = chain.height;
@@ -136,6 +144,26 @@ function verifyArchive(params, archive, passphrase) {
  * Write a node backup and verify it by reading the finished file back,
  * replaying its chain and decrypting its wallet.
  */
+/**
+ * The block array of the archive as text, in chunks, so a caller can report how
+ * much of the chain has been serialized. Joining the chunks is exactly what one
+ * `JSON.stringify(blocks)` produces: an array's serialization is its elements
+ * separated by commas.
+ */
+function serializeBlocks(blocks, onChunk) {
+  if (blocks.length === 0) {
+    return '[]';
+  }
+  const parts = [];
+  for (let index = 0; index < blocks.length; index += PROGRESS_BLOCKS) {
+    parts.push(
+      JSON.stringify(blocks.slice(index, index + PROGRESS_BLOCKS)).slice(1, -1),
+    );
+    onChunk?.(Math.min(index + PROGRESS_BLOCKS, blocks.length));
+  }
+  return `[${parts.join(',')}]`;
+}
+
 export function createNodeBackup({
   params,
   chainFile,
@@ -143,6 +171,7 @@ export function createNodeBackup({
   destination,
   passphrase,
   createdAt = new Date().toISOString(),
+  onProgress,
 }) {
   const wallet = Wallet.load(walletFile, params);
   if (!wallet) {
@@ -160,7 +189,29 @@ export function createNodeBackup({
     throw new Error(`no chain at ${chainFile}`);
   }
 
-  const archive = {
+  const blocks = chain.blocks;
+  const total = blocks.length;
+  // Writing fills the first half of the bar and verifying the second: both are
+  // per block, and the gap between them is the gzip and the file write, which
+  // have no block to count.
+  const report = (phase, done) => {
+    if (!onProgress) {
+      return;
+    }
+    const fraction = total > 0 ? Math.min(1, done / total) : 1;
+    const percent =
+      phase === 'writing'
+        ? Math.round(fraction * 50)
+        : 50 + Math.round(fraction * 50);
+    onProgress({ phase, done, total, percent });
+  };
+
+  report('writing', 0);
+  // The archive is assembled around the block array so the array can be written
+  // in chunks: the rest is one object, serialized in the same key order, and the
+  // placeholder is replaced with exactly the text `JSON.stringify(blocks)`
+  // would have produced.
+  const template = {
     format: NODE_BACKUP_FORMAT,
     version: NODE_BACKUP_VERSION,
     network: params.name,
@@ -173,12 +224,14 @@ export function createNodeBackup({
     chain: {
       version: 1,
       network: params.name,
-      blocks: chain.blocks,
+      blocks: '<blocks>',
       mempool: [],
     },
     wallet: wallet.data,
   };
-  const text = JSON.stringify(archive);
+  const blocksJson = serializeBlocks(blocks, (done) => report('writing', done));
+  // A function replacer, so `$&`-style sequences in block data stay literal.
+  const text = JSON.stringify(template).replace('"<blocks>"', () => blocksJson);
   const compressed = zlib.gzipSync(Buffer.from(text));
   // Name the file for what it is, and keep a caller-supplied .gz suffix as is.
   const file = destination.endsWith('.gz') ? destination : `${destination}.gz`;
@@ -194,12 +247,30 @@ export function createNodeBackup({
     throw error;
   }
 
+  // The write is complete: the chain is all in the file, and what remains is
+  // reading it back, decrypting the wallet and replaying every block.
+  report('writing', total);
+  let lastVerified = 0;
+  const verifying = (done) => {
+    if (done !== total && done - lastVerified < PROGRESS_BLOCKS) {
+      return;
+    }
+    lastVerified = done;
+    report('verifying', done);
+  };
+
   try {
     const written = readArchive(file);
-    const verified = verifyArchive(params, written, passphrase);
+    const verified = verifyArchive(params, written, passphrase, verifying);
+    // The file's last write is when the archive finished being written, taken
+    // now rather than read later: a copy or a restore may move the mtime, but
+    // what this run did does not change. Verification follows, so this is the
+    // write, not the whole job.
+    const stats = fs.statSync(file);
     return {
       path: file,
-      bytes: fs.statSync(file).size,
+      bytes: stats.size,
+      writtenAt: stats.mtime.toISOString(),
       rawBytes: Buffer.byteLength(text),
       height: verified.height,
       tip: verified.tip,

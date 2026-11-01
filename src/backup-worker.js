@@ -52,6 +52,10 @@ function runJob(job) {
     destination: job.destination,
     passphrase: job.passphrase,
     ...(job.createdAt ? { createdAt: job.createdAt } : {}),
+    // Progress messages are tagged with the job so the node can tell them from
+    // the result, which is the only other thing this thread sends.
+    onProgress: (progress) =>
+      parentPort?.postMessage({ id: job.id, progress }),
   });
 }
 

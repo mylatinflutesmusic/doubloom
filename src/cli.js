@@ -14,7 +14,10 @@ import { readPassphrase } from './passphrase.js';
 import { assertPassphrase } from './wallet-crypto.js';
 import { createNodeBackup, restoreNodeBackup } from './backup.js';
 import {
+  backupAgeMs,
+  backupMaxAgeMs,
   backupStatusFile,
+  backupVerdict,
   listArchives,
   loadBackupStatus,
   normalizeRetention,
@@ -52,7 +55,9 @@ ${BOLD}Commands${RESET}
   tx <txid>                  Show a transaction
   validate                   Re-validate the entire chain
   backup <file>              Back up the chain and encrypted wallet
-  backup now                 Ask a running node to back up immediately
+  backup now [--to <path>]   Ask a running node to back up immediately, or to
+                             write an export to <path> outside its backup
+                             directory
   backup list                List archives with their size and the retention
                              tier that keeps each one
   backup status [--json] [--watch]
@@ -102,6 +107,9 @@ ${BOLD}Options${RESET}
   --backup-keep-weekly <n>   Weekly archives to retain (default 4)
   --backup-max-age <min>     Warn when the last backup is older than this
                              (default twice the interval, at least 1 min)
+  --backup-max-lag <blocks>  Flag an archive this many blocks behind the tip
+                             (default the blocks in one interval: 6 for an
+                             hourly schedule at 10-minute spacing)
   --backup-verify-interval <min>
                              Restore the newest archive to a temporary
                              directory this often (default 360, 0 disables)
@@ -287,42 +295,96 @@ function timeFromNow(iso) {
  * request immediately with an id, because the archive is written and verified
  * in the background; polling is what turns that back into a blocking command.
  */
+/**
+ * The percentage of a running backup, as `42% verified (420/1,000 blocks)`, or
+ * null when the node has not reported a figure yet — an older node reports none
+ * at all, and the caller then falls back to elapsed time alone.
+ */
+function backupProgressText(progress) {
+  if (!progress || !Number.isInteger(progress.percent)) {
+    return null;
+  }
+  const phase = progress.phase === 'verifying' ? 'verified' : 'written';
+  const counts =
+    Number.isInteger(progress.done) &&
+    Number.isInteger(progress.total) &&
+    progress.total > 0
+      ? ` (${progress.done.toLocaleString()}/${progress.total.toLocaleString()} blocks)`
+      : '';
+  return `${progress.percent}% ${phase}${counts}`;
+}
+
 async function waitForBackupJob(nodeUrl, id) {
   const started = Date.now();
-  for (;;) {
-    let response;
-    try {
-      response = await fetch(
-        `${nodeUrl}/api/backup/jobs/${encodeURIComponent(id)}`,
-        { signal: AbortSignal.timeout(10_000) },
-      );
-    } catch {
-      throw new Error(
-        `lost contact with ${nodeUrl} while backup job ${id} was running; check "doubloom backup status"`,
-      );
+  // Writing and verifying a large archive keeps the node busy for seconds and
+  // says nothing meanwhile. A terminal gets one line rewritten in place, so the
+  // wait reads as a clock; a pipe (a log file, CI) gets a line every five
+  // seconds rather than a stream of carriage returns.
+  const interactive = Boolean(process.stdout.isTTY);
+  const everyMs = interactive ? 1000 : 5000;
+  let printed = false;
+  let nextProgressAt = started + everyMs;
+  try {
+    for (;;) {
+      let response;
+      try {
+        response = await fetch(
+          `${nodeUrl}/api/backup/jobs/${encodeURIComponent(id)}`,
+          { signal: AbortSignal.timeout(10_000) },
+        );
+      } catch {
+        throw new Error(
+          `lost contact with ${nodeUrl} while backup job ${id} was running; check "doubloom backup status"`,
+        );
+      }
+      const payload = await response.json().catch(() => ({}));
+      if (response.status === 404) {
+        throw new Error(
+          `the node at ${nodeUrl} does not expose /api/backup/jobs; update it`,
+        );
+      }
+      if (!response.ok) {
+        throw new Error(
+          payload.error ?? `node returned HTTP ${response.status}`,
+        );
+      }
+      const job = payload.job;
+      if (!job) {
+        throw new Error('the node returned no backup job');
+      }
+      if (job.state !== 'running') {
+        return job;
+      }
+      if (Date.now() >= nextProgressAt) {
+        // The node counts the blocks it has written and then re-verified, so
+        // the percentage is measured work rather than an estimate. A node too
+        // old to report any leaves the line as elapsed time alone.
+        const seconds = Math.round((Date.now() - started) / 1000);
+        const detail = backupProgressText(job.progress);
+        const line = detail
+          ? `waiting for the node · ${detail} · ${seconds}s`
+          : `waiting for the node to write and verify the archive · ${seconds}s`;
+        if (interactive) {
+          process.stdout.write(`\r${DIM}${line}${RESET}\x1b[K`);
+        } else {
+          console.log(line);
+        }
+        printed = true;
+        nextProgressAt = Date.now() + everyMs;
+      }
+      if (Date.now() - started > 300_000) {
+        throw new Error(
+          `backup job ${id} did not finish within five minutes; check "doubloom backup status"`,
+        );
+      }
+      await new Promise((resolve) => setTimeout(resolve, 250));
     }
-    const payload = await response.json().catch(() => ({}));
-    if (response.status === 404) {
-      throw new Error(
-        `the node at ${nodeUrl} does not expose /api/backup/jobs; update it`,
-      );
+  } finally {
+    // Leave the progress line behind before the report starts, so the table is
+    // not printed on top of it. A piped run has already printed whole lines.
+    if (printed && interactive) {
+      process.stdout.write('\r\x1b[K');
     }
-    if (!response.ok) {
-      throw new Error(payload.error ?? `node returned HTTP ${response.status}`);
-    }
-    const job = payload.job;
-    if (!job) {
-      throw new Error('the node returned no backup job');
-    }
-    if (job.state !== 'running') {
-      return job;
-    }
-    if (Date.now() - started > 300_000) {
-      throw new Error(
-        `backup job ${id} did not finish within five minutes; check "doubloom backup status"`,
-      );
-    }
-    await new Promise((resolve) => setTimeout(resolve, 250));
   }
 }
 
@@ -427,13 +489,27 @@ async function triggerNodeBackup(ctx, flags) {
   }
   const nodeUrl = `http://127.0.0.1:${port}`;
 
+  // Resolved here rather than taken as typed: the node reads its own working
+  // directory, and an operator at a shell expects a relative path to mean the
+  // one they are standing in.
+  const destination =
+    flags.to === undefined ? null : path.resolve(String(flags.to));
+
+  // A plain run sends no body at all, so a node that predates exports sees the
+  // same request it always did; only an export needs one.
+  const request = {
+    method: 'POST',
+    // The node answers as soon as the job is queued; the wait happens below.
+    signal: AbortSignal.timeout(30_000),
+  };
+  if (destination) {
+    request.headers = { 'content-type': 'application/json' };
+    request.body = JSON.stringify({ destination });
+  }
+
   let response;
   try {
-    response = await fetch(`${nodeUrl}/api/backup`, {
-      method: 'POST',
-      // The node answers as soon as the job is queued; the wait happens below.
-      signal: AbortSignal.timeout(30_000),
-    });
+    response = await fetch(`${nodeUrl}/api/backup`, request);
   } catch {
     throw new Error(
       `no node answering at ${nodeUrl}; start one with "doubloom node" or pass --port`,
@@ -492,14 +568,27 @@ async function triggerNodeBackup(ctx, flags) {
     );
   }
   console.log(
-    `\n${DIM}The archive holds every confirmed block and the encrypted wallet,\nand stays in the node's backup directory under its retention rules.${RESET}\n`,
+    destination
+      ? `\n${DIM}The archive holds every confirmed block and the encrypted wallet;\nthis export sits outside the node's backup directory, where retention\nwill never remove it.${RESET}\n`
+      : `\n${DIM}The archive holds every confirmed block and the encrypted wallet,\nand stays in the node's backup directory under its retention rules.${RESET}\n`,
   );
+}
+
+/** The chain's height, or null when there is no chain file to read. */
+function chainHeightOrNull(ctx) {
+  try {
+    const chain = loadChain(ctx.params, ctx.chainFile);
+    return chain ? chain.height : null;
+  } catch {
+    return null;
+  }
 }
 
 /**
  * The backup record as plain data: exactly what the status file holds, plus the
- * owning process's liveness and where the record came from, so a script does
- * not have to reimplement the running-pid check.
+ * owning process's liveness, where the record came from, and one computed
+ * verdict, so a script does not have to reimplement the running-pid check or the
+ * age and lag rules.
  *
  * `nextRunAt` is null unless the recorded node is alive. A status file left
  * behind by an exited node still carries the timestamp it intended, but that
@@ -521,18 +610,30 @@ function backupStatusPayload(ctx) {
   }
 
   const running = Boolean(status?.pid && processIsRunning(status.pid));
+  // The lag rule needs the chain the archive is supposed to represent; without
+  // a chain file there is nothing to compare against, so only age decides.
+  const tipHeight = chainHeightOrNull(ctx);
+  const nowMs = Date.now();
 
   return {
     network: ctx.params.name,
     statusFile,
     configured: Boolean(status),
     running,
+    // One word a script can branch on instead of re-deriving the age and lag
+    // rules: healthy, stale, behind, failed, waiting or unknown.
+    verdict: backupVerdict({ status, tipHeight, nowMs }),
+    // How old the newest archive is, measured once so it is the same age the
+    // verdict above was reached from, and null when there is no archive.
+    lastArchiveAgeMs: backupAgeMs(status, nowMs),
+    tipHeight,
     pid: status?.pid ?? null,
     directory: status?.directory ?? null,
     intervalMs: status?.intervalMs ?? null,
     firstDelayMs: status?.firstDelayMs ?? null,
     firstMaxWaitMs: status?.firstMaxWaitMs ?? null,
     maxAgeMs: status?.maxAgeMs ?? null,
+    maxLagBlocks: status?.maxLagBlocks ?? null,
     retention: status?.retention ?? null,
     recoveryHistoryLimit: status?.recoveryHistoryLimit ?? null,
     nextRunAt: running ? (status?.nextRunAt ?? null) : null,
@@ -540,9 +641,44 @@ function backupStatusPayload(ctx) {
     lastAttemptAt: status?.lastAttemptAt ?? null,
     lastError: status?.lastError ?? null,
     lastBackup: status?.lastBackup ?? null,
+    maxArchiveAgeMs: status ? backupMaxAgeMs(status) : null,
     lastRecovery: status?.lastRecovery ?? null,
     recoveryHistory: status?.recoveryHistory ?? [],
+    archives: retainedArchiveEntries(status, ctx.params.name),
   };
+}
+
+/**
+ * The archives retention keeps, newest first, with how long each took to write.
+ * The schedule records both ends of every write it performs, and those are used
+ * first; an archive from before that record existed falls back to what is on
+ * disk — the name for the attempt, the file's last write for the finish.
+ */
+function retainedArchiveEntries(status, network) {
+  if (!status?.directory) {
+    return [];
+  }
+  const archives = listArchives({
+    directory: status.directory,
+    network,
+    writes: status.archiveWrites ?? null,
+  });
+  const kept = retentionAssignments(
+    archives,
+    status.retention ?? normalizeRetention(),
+  );
+  return archives
+    .filter((archive) => kept.has(archive.name))
+    .map((archive) => ({
+      name: archive.name,
+      at: archive.at,
+      // The two ends the duration comes from, so a script does not have to
+      // subtract `writeMs` from the archive time itself.
+      startedAt: archive.startedAt ?? null,
+      finishedAt: archive.finishedAt ?? null,
+      bytes: archive.bytes,
+      writeMs: archive.writeMs ?? null,
+    }));
 }
 
 /** How long ago a timestamp was, in the same two-unit style as `timeFromNow`. */
@@ -623,6 +759,12 @@ function backupStatusLines(ctx) {
             Number.isFinite(status.maxAgeMs)
               ? ` · max age ${formatDuration(status.maxAgeMs)}`
               : ''
+          }${
+            Number.isInteger(status.maxLagBlocks)
+              ? ` · lag ${status.maxLagBlocks} block${
+                  status.maxLagBlocks === 1 ? '' : 's'
+                }`
+              : ''
           }`
   );
   if (status.directory) {
@@ -662,39 +804,76 @@ function backupStatusLines(ctx) {
   emit(
     'last recovery',
     recoveryHistory.length > 0
-      ? `${isoTimestamp(recoveryHistory[0].at)} · ${recoveryHistory[0].reason}`
+      ? `${isoTimestamp(recoveryHistory[0].at)} ${DIM}(${timeAgo(
+          recoveryHistory[0].at,
+        )})${RESET} · ${recoveryHistory[0].reason}`
       : 'none',
   );
   for (const recovery of recoveryHistory.slice(1)) {
     emit(
       'earlier',
-      `${isoTimestamp(recovery.at)} · ${recovery.reason}`,
+      `${isoTimestamp(recovery.at)} ${DIM}(${timeAgo(recovery.at)})${RESET} · ${recovery.reason}`,
     );
   }
 
   if (status.lastBackup) {
     const last = status.lastBackup;
+    // Both sizes when the node recorded them: what the file costs on disk and
+    // what it holds, which is what makes the gzip saving meaningful.
+    const savedPercent =
+      Number.isFinite(last.rawBytes) && last.rawBytes > last.bytes
+        ? Math.round((1 - last.bytes / last.rawBytes) * 100)
+        : null;
     const size = Number.isFinite(last.bytes)
-      ? ` · ${last.bytes.toLocaleString()} bytes`
+      ? ` · ${last.bytes.toLocaleString()} bytes${
+          savedPercent === null
+            ? ''
+            : ` gzipped (from ${last.rawBytes.toLocaleString()} raw, ${savedPercent}% smaller)`
+        }`
+      : '';
+    const keys = Number.isFinite(last.keys)
+      ? ` · ${last.keys} key${last.keys === 1 ? '' : 's'}`
       : '';
     emit(
       'last archive',
-      `${isoTimestamp(last.at)} ${DIM}(${timeAgo(last.at)})${RESET} · height ${last.height.toLocaleString()}${size}`,
+      `${isoTimestamp(last.at)} ${DIM}(${timeAgo(last.at)})${RESET} · height ${last.height.toLocaleString()}${size}${keys}`,
     );
     emit('archive', last.path);
   } else {
     emit('last archive', 'none yet');
   }
 
+  // Every archive retention keeps, with the time it took to write. The newest
+  // appears above too, but a list is what makes the older ones comparable.
+  for (const archive of retainedArchiveEntries(status, ctx.params.name)) {
+    emit(
+      'retained',
+      `${isoTimestamp(archive.at)} · ${formatFileSize(archive.bytes)}${
+        archive.writeMs === null
+          ? ` ${DIM}· write time not recorded${RESET}`
+          : ` · wrote in ${formatWriteDuration(archive.writeMs)}`
+      }`,
+    );
+  }
+
   if (status.lastError) {
     emit('last error', `${RED}${status.lastError}${RESET}`);
     if (status.lastAttemptAt) {
-      emit('attempted', isoTimestamp(status.lastAttemptAt));
+      emit(
+        'attempted',
+        `${isoTimestamp(status.lastAttemptAt)} ${DIM}(${timeAgo(
+          status.lastAttemptAt,
+        )})${RESET}`,
+      );
     }
   } else {
     emit(
       'last attempt',
-      status.lastAttemptAt ? isoTimestamp(status.lastAttemptAt) : 'none yet',
+      status.lastAttemptAt
+        ? `${isoTimestamp(status.lastAttemptAt)} ${DIM}(${timeAgo(
+            status.lastAttemptAt,
+          )})${RESET}`
+        : 'none yet',
     );
     emit('last error', 'none');
   }
@@ -717,6 +896,23 @@ function utcStamp(value) {
     return String(value);
   }
   return date.toISOString().replace('T', ' ').replace('Z', '');
+}
+
+/**
+ * A write duration: milliseconds below a second, because an archive of a small
+ * chain is written in tens of milliseconds and "0.0s" would say nothing.
+ */
+function formatWriteDuration(milliseconds) {
+  if (!Number.isFinite(milliseconds)) {
+    return '—';
+  }
+  if (milliseconds < 1000) {
+    return `${Math.max(1, Math.round(milliseconds))}ms`;
+  }
+  if (milliseconds < 60_000) {
+    return `${(milliseconds / 1000).toFixed(1)}s`;
+  }
+  return formatDuration(milliseconds);
 }
 
 function formatFileSize(bytes) {
@@ -1587,7 +1783,7 @@ async function main() {
       const destination = args[0];
       if (!destination) {
         throw new Error(
-          'usage: doubloom backup <file> | doubloom backup now | doubloom backup status',
+          'usage: doubloom backup <file> | doubloom backup now [--to <path>] | doubloom backup status',
         );
       }
       const wallet = requireWallet(ctx);
@@ -1943,6 +2139,19 @@ passphrase. Restore it with: doubloom wallet restore <file>${RESET}\n`,
           }
           maxAgeMs = Math.round(maxAgeMinutes * 60_000);
         }
+        let maxLagBlocks;
+        if (flags['backup-max-lag'] !== undefined) {
+          if (flags['backup-max-lag'] === true) {
+            throw new Error('--backup-max-lag requires a number of blocks');
+          }
+          const lag = Number(flags['backup-max-lag']);
+          if (!Number.isInteger(lag) || lag < 1) {
+            throw new Error(
+              '--backup-max-lag must be a positive whole number of blocks',
+            );
+          }
+          maxLagBlocks = lag;
+        }
         const recoveryHistoryLimit = Number(
           flags['backup-recovery-history'] ?? 5,
         );
@@ -2012,6 +2221,7 @@ passphrase. Restore it with: doubloom wallet restore <file>${RESET}\n`,
           firstMaxWaitMs,
           intervalMs: Math.max(1000, Math.round(minutes * 60_000)),
           maxAgeMs,
+          maxLagBlocks,
           retention,
           recoveryHistoryLimit,
           verifyIntervalMs,

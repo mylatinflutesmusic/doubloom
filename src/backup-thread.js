@@ -27,6 +27,9 @@ export function createBackupWorker() {
   // Set when the node closes mid-job: the archive in flight is allowed to
   // finish, because killing the thread mid-write would leave a truncated file.
   let stopAfterJob = false;
+  // Set while the running job is being cancelled. The exit that follows is then
+  // reported as a cancellation, not as a thread that died.
+  let cancellation = null;
   // Resolved when the thread has actually been told to stop, so a shutting-down
   // process can wait for that last archive instead of exiting over it.
   let notifyStopped = null;
@@ -41,6 +44,12 @@ export function createBackupWorker() {
     instance.on('message', (message) => {
       const job = pending.get(message?.id);
       if (!job) {
+        return;
+      }
+      // A progress report is not the end of the job: hand it to the caller and
+      // keep waiting for the result.
+      if (message.progress) {
+        job.onProgress?.(message.progress);
         return;
       }
       pending.delete(job.id);
@@ -73,6 +82,20 @@ export function createBackupWorker() {
         }
         pending.clear();
         stopAfterJob = false;
+        return;
+      }
+      if (cancellation) {
+        // The operator stopped this one: reject only the job that was running,
+        // and leave the queue to start again on a fresh thread.
+        const error = cancellation;
+        cancellation = null;
+        for (const job of pending.values()) {
+          pending.delete(job.id);
+          job.reject(error);
+        }
+        if (queue.length > 0) {
+          drain();
+        }
         return;
       }
       // A thread that dies takes its job with it, but the next one starts a
@@ -137,28 +160,31 @@ export function createBackupWorker() {
     pending.clear();
   }
 
-  function enqueue(message) {
+  function enqueue(message, onProgress = null) {
     if (closing) {
       return Promise.reject(new Error('the backup worker is stopped'));
     }
     const id = nextId++;
     return new Promise((resolve, reject) => {
-      queue.push({ id, message: { ...message, id }, resolve, reject });
+      queue.push({ id, message: { ...message, id }, resolve, reject, onProgress });
       drain();
     });
   }
 
   return {
     runBackup(job) {
-      return enqueue({
-        mode: 'backup',
-        network: job.params.name,
-        chainFile: job.chainFile,
-        walletFile: job.walletFile,
-        destination: job.destination,
-        passphrase: job.passphrase,
-        createdAt: job.createdAt,
-      });
+      return enqueue(
+        {
+          mode: 'backup',
+          network: job.params.name,
+          chainFile: job.chainFile,
+          walletFile: job.walletFile,
+          destination: job.destination,
+          passphrase: job.passphrase,
+          createdAt: job.createdAt,
+        },
+        job.onProgress,
+      );
     },
     verifyBackup(job) {
       return enqueue({
@@ -168,6 +194,25 @@ export function createBackupWorker() {
         passphrase: job.passphrase,
         tempRoot: job.tempRoot,
       });
+    },
+    /**
+     * Stop the job that is running, if any. The thread is terminated — a
+     * backup spends its time in synchronous work, so there is no safe point to
+     * ask it to stop — and its promise is rejected with an error marked
+     * `cancelled`, which is what tells the caller the archive is not usable.
+     * Returns false when nothing was running, so a caller can report that.
+     */
+    cancelRunning() {
+      if (pending.size === 0) {
+        return false;
+      }
+      const error = new Error('backup cancelled by the operator');
+      error.cancelled = true;
+      cancellation = error;
+      const instance = worker;
+      worker = null;
+      instance?.terminate().catch(() => {});
+      return true;
     },
     /** Diagnostic: how many threads this instance started, and how many jobs. */
     stats() {
