@@ -1477,6 +1477,21 @@ dependencies, so the workflow has no install step and needs no lockfile; add
 Node's built-in test runner and temp directories, so it runs the same on Linux,
 macOS and Windows.
 
+A second job, `every-commit`, asks the other question: not whether the tip passes,
+but whether every commit under it does. `git bisect` is only worth something if
+each commit it lands on was green when it was written, so this job walks the
+commits a push added, oldest first, and stops at the first one whose suite
+fails, naming it. `scripts/test-every-commit.sh` does the walking and can be run
+locally the same way: `scripts/test-every-commit.sh HEAD~5..HEAD`, or a single
+revision to check everything reachable from it. Each commit is checked out in a
+throwaway worktree under the temp directory, so the checkout you are working in
+is never touched and the files the suite writes die with the worktree; a commit
+whose tree matches the one before it (an empty merge, or a revert and re-apply)
+is skipped, because the suite cannot tell them apart. A push to a new branch has
+no base commit to walk from, so that job checks everything reachable from the
+tip. It runs on one Node version and costs one suite run per commit, which is
+why it is given a longer timeout than the matrix above.
+
 The suite covers key generation and signatures, genesis determinism and
 proof-of-work, the halving schedule and supply cap, payments and fees, coinbase
 maturity, double-spend/signature/low-fee rejection, malformed blocks, reorgs by

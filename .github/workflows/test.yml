@@ -3,7 +3,10 @@ name: Tests
 # Every push runs the suite, on any branch, against every Node.js version the
 # package claims to support: `engines.node` is >=18, so 18 is the oldest and 20
 # the current LTS. The project has no dependencies, so there is no install step;
-# add `npm ci` (and commit the lockfile it needs) if that ever changes.
+# add `npm ci` (and commit the lockfile it needs) if that ever changes. A second
+# job then checks that every commit in the push passes on its own, not just the
+# tip, using one Node version to keep a walk that costs one suite run per commit
+# affordable.
 on:
   push:
 
@@ -33,3 +36,50 @@ jobs:
 
       - name: Run the test suite (Node.js ${{ matrix.node-version }})
         run: npm test
+
+  # The job above proves the tip works; this one proves every commit under it
+  # does. A commit that cannot pass the suite on its own makes `git bisect`
+  # blame a bystander, so the range a push adds is walked oldest-first and the
+  # first commit that fails is named.
+  every-commit:
+    runs-on: ubuntu-latest
+    # Proportional to the range, not to the suite: a ten-commit push is ten
+    # suite runs. The generous ceiling is for exactly that, not for a slow suite.
+    timeout-minutes: 60
+    steps:
+      - name: Check out the push and the commits before it
+        uses: actions/checkout@v4
+        with:
+          # The tip alone is not enough to walk back from.
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          # One version only: the matrix above already covers 18.x against the
+          # tip, and walking the range on both would double a job that is
+          # already the slow one.
+          node-version: '20.x'
+
+      # Invoked through bash so the script does not depend on its executable bit
+      # surviving a checkout on a filesystem that drops it.
+      - name: Test every commit in the push
+        env:
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.event.after }}
+        run: |
+          set -euo pipefail
+          nothing=0000000000000000000000000000000000000000
+          if [ "${AFTER}" = "${nothing}" ]; then
+            echo "No commit was pushed (branch deleted); nothing to check."
+            exit 0
+          fi
+          # A new branch reports an all-zero "before", and a force-push can name
+          # a commit this checkout no longer has. Neither has a range to walk, so
+          # every commit reachable from the tip is checked instead.
+          if [ "${BEFORE}" != "${nothing}" ] && git cat-file -e "${BEFORE}^{commit}" 2>/dev/null; then
+            bash scripts/test-every-commit.sh "${BEFORE}..${AFTER}"
+          else
+            echo "No usable base commit for this push; checking everything reachable from ${AFTER}."
+            bash scripts/test-every-commit.sh "${AFTER}"
+          fi
