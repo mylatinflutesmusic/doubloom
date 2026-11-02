@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from 'node:crypto';
+import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 import fs from 'node:fs';
 import http from 'node:http';
 import os from 'node:os';
@@ -107,6 +107,122 @@ function normalizeHost(address) {
   const text = String(address ?? '');
   const bare = text.replace(/^\[|\]$/g, '');
   return bare.startsWith('::ffff:') ? bare.slice('::ffff:'.length) : bare;
+}
+
+/**
+ * Endpoints that change what this process does or hand out its files. They
+ * belong to the operator, not to a peer: the peer protocol needs only the
+ * chain, block, transaction, mempool and peer endpoints, so a node reachable
+ * from another machine still syncs while these stay shut to strangers.
+ */
+const CONTROL_ROUTES = [
+  ['POST', '/api/mining'],
+  ['POST', '/api/backup'],
+  ['DELETE', '/api/backup/jobs/'],
+  ['GET', '/api/backup/archives/'],
+  ['GET', '/api/backup/download'],
+];
+
+/** Whether `method` and `pathname` match one of these routes; a trailing slash is a prefix. */
+function matchesRoute(routes, method, pathname) {
+  return routes.some(
+    ([routeMethod, routePath]) =>
+      routeMethod === method &&
+      (routePath.endsWith('/')
+        ? pathname.startsWith(routePath)
+        : pathname === routePath),
+  );
+}
+
+/** Whether this method and path belongs to the operator; a trailing slash is a prefix. */
+export function isControlRoute(method, pathname) {
+  return matchesRoute(CONTROL_ROUTES, method, pathname);
+}
+
+/**
+ * The archive downloads, a subset of the operator routes. A backup holds the
+ * whole chain and the encrypted wallet, so taking a copy is a bigger permission
+ * than pausing the miner: the token unlocks the controls, and a copy from
+ * another machine also needs the operator to say so.
+ */
+const DOWNLOAD_ROUTES = [
+  ['GET', '/api/backup/archives/'],
+  ['GET', '/api/backup/download'],
+];
+
+/** Whether this request would hand out a backup archive rather than steer the node. */
+export function isDownloadRoute(method, pathname) {
+  return matchesRoute(DOWNLOAD_ROUTES, method, pathname);
+}
+
+/** Whether a socket address is this machine, including the IPv4-mapped form. */
+export function isLoopbackAddress(address) {
+  const host = normalizeHost(address);
+  return (
+    host === '::1' || host === 'localhost' || /^127\.\d+\.\d+\.\d+$/.test(host)
+  );
+}
+
+/** The token from an `Authorization: Bearer <token>` header, or null. */
+function bearerToken(header) {
+  if (typeof header !== 'string') {
+    return null;
+  }
+  const token = /^Bearer[ \t]+(.+)$/i.exec(header.trim())?.[1].trim();
+  return token ? token : null;
+}
+
+/**
+ * Constant time, and the same comparison whatever was presented: both sides are
+ * hashed first, so a wrong length cannot be told apart from a wrong token.
+ */
+function tokenMatches(presented, expected) {
+  if (!presented || !expected) {
+    return false;
+  }
+  return timingSafeEqual(
+    createHash('sha256').update(presented).digest(),
+    createHash('sha256').update(expected).digest(),
+  );
+}
+
+/**
+ * Why a request may not use the operator endpoints, or null when it may.
+ * Loopback is always the operator — the CLI and the explorer call from this
+ * machine — and anything else needs the token the node was started with, so a
+ * node without one keeps its controls here by default. Even with the token, an
+ * archive stays put unless the operator opted into remote downloads.
+ */
+export function controlRefusalReason(
+  { method, pathname, remoteAddress, authorization },
+  apiToken = null,
+  { allowRemoteDownloads = false } = {},
+) {
+  if (!isControlRoute(method, pathname)) {
+    return null;
+  }
+  if (isLoopbackAddress(remoteAddress)) {
+    return null;
+  }
+  if (!tokenMatches(bearerToken(authorization), apiToken)) {
+    return (
+      'this endpoint is available on loopback only, or with the token the node ' +
+      'was started with (Authorization: Bearer ...)'
+    );
+  }
+  if (isDownloadRoute(method, pathname) && !allowRemoteDownloads) {
+    return (
+      'backup archives carry the chain and the encrypted wallet, so they are ' +
+      'downloaded on the node itself; start it with --allow-remote-downloads ' +
+      'to permit a copy from another machine'
+    );
+  }
+  return null;
+}
+
+/** Whether a request may use the operator endpoints. */
+export function controlRouteAllowed(request, apiToken = null, options = {}) {
+  return controlRefusalReason(request, apiToken, options) === null;
 }
 
 async function readJson(request, limit = 2_000_000) {
@@ -303,8 +419,122 @@ export function startNode(options) {
       console.log(message);
     }
   };
+  // A refused control request is worth saying out loud, but a stranger can send
+  // them faster than anyone can read a log, so repeats are summarised: one line
+  // per five seconds, carrying how many arrived since.
+  let refusedControls = 0;
+  let refusedControlLoggedAt = 0;
+  function noteControlRefusal(method, pathname) {
+    refusedControls += 1;
+    const now = Date.now();
+    if (refusedControlLoggedAt !== 0 && now - refusedControlLoggedAt < 5_000) {
+      return;
+    }
+    refusedControlLoggedAt = now;
+    console.warn(
+      'refused ' +
+        method +
+        ' ' +
+        pathname +
+        ' from outside this machine (' +
+        refusedControls +
+        ' refused so far); control endpoints answer on loopback, or to a ' +
+        'bearer token when one was configured',
+    );
+  }
+  /**
+   * The two endpoints a stranger can use to make this node do work it would
+   * rather not: a transaction costs a validation and a chain write, and a peer
+   * URL is dialled later. Rules are per address so one caller cannot crowd out
+   * the rest, and loopback is the operator, so the CLI is never throttled.
+   */
+  const RATE_LIMIT_RULES = {
+    tx: { limit: 60, windowMs: 60_000 },
+    peers: { limit: 30, windowMs: 60_000 },
+  };
+  const rateWindows = new Map();
+  let throttledRequests = 0;
+  let throttledLoggedAt = 0;
+  /** Answer a request over its address's allowance with 429, and say why. */
+  function refuseThrottled(response, kind, address) {
+    if (isLoopbackAddress(address)) {
+      return false;
+    }
+    const rule = RATE_LIMIT_RULES[kind];
+    const host = normalizeHost(address);
+    const key = kind + '|' + host;
+    const now = Date.now();
+    // Windows are dropped when the map grows, so a stranger cannot make this
+    // node remember addresses forever.
+    if (rateWindows.size > 1024) {
+      for (const [entry, window] of rateWindows) {
+        if (now - window.start >= window.windowMs) {
+          rateWindows.delete(entry);
+        }
+      }
+      while (rateWindows.size > 1024) {
+        let oldestKey = null;
+        let oldestStart = Infinity;
+        for (const [entry, window] of rateWindows) {
+          if (window.start < oldestStart) {
+            oldestStart = window.start;
+            oldestKey = entry;
+          }
+        }
+        rateWindows.delete(oldestKey);
+      }
+    }
+    let window = rateWindows.get(key);
+    if (!window || now - window.start >= window.windowMs) {
+      window = { start: now, count: 0, windowMs: rule.windowMs };
+      rateWindows.set(key, window);
+    }
+    window.count += 1;
+    if (window.count <= rule.limit) {
+      return false;
+    }
+    // One line per five seconds, like a refused control request: a caller that
+    // keeps knocking is not worth a log line each time.
+    throttledRequests += 1;
+    if (throttledLoggedAt === 0 || now - throttledLoggedAt >= 5_000) {
+      throttledLoggedAt = now;
+      console.warn(
+        'throttled ' +
+          kind +
+          ' requests from ' +
+          host +
+          ' (' +
+          throttledRequests +
+          ' refused so far); at most ' +
+          rule.limit +
+          ' per ' +
+          Math.round(rule.windowMs / 1000) +
+          's',
+      );
+    }
+    const retryAfter = Math.max(
+      1,
+      Math.ceil((window.start + window.windowMs - now) / 1000),
+    );
+    response.setHeader('retry-after', String(retryAfter));
+    sendJson(response, 429, {
+      error:
+        'too many ' + kind + ' requests from ' + host + '; retry in ' +
+        retryAfter + 's',
+    });
+    return true;
+  }
   const wallet = options.wallet ?? null;
   const host = options.host ?? '127.0.0.1';
+  // Set only when the operator wants to reach the control endpoints from
+  // another machine; without it they answer on loopback alone.
+  const apiToken =
+    typeof options.apiToken === 'string' && options.apiToken.trim() !== ''
+      ? options.apiToken.trim()
+      : null;
+  // Taking a copy off this machine is a separate decision from steering it: a
+  // token that leaks should not also hand over the wallet.
+  const allowRemoteDownloads = options.allowRemoteDownloads === true;
   const port = options.port ?? params.defaultPort;
   const peers = new Set((options.peers ?? []).filter(Boolean));
   /**
@@ -1070,6 +1300,27 @@ export function startNode(options) {
     const pathname = url.pathname;
     const method = request.method ?? 'GET';
 
+    // Operator controls are not part of the peer protocol: a node bound beyond
+    // loopback still syncs, but only this machine (or a caller holding the token
+    // the node was started with) can pause mining or run a backup, and the
+    // archives leave only when remote downloads were allowed. Checked before any
+    // handler so no route can forget the rule.
+    const refusal = controlRefusalReason(
+      {
+        method,
+        pathname,
+        remoteAddress: request.socket?.remoteAddress,
+        authorization: request.headers?.authorization,
+      },
+      apiToken,
+      { allowRemoteDownloads },
+    );
+    if (refusal !== null) {
+      noteControlRefusal(method, pathname);
+      sendJson(response, 403, { error: refusal });
+      return;
+    }
+
     if (method === 'GET' && pathname === '/') {
       response.writeHead(200, {
         'content-type': 'text/html; charset=utf-8',
@@ -1604,6 +1855,11 @@ export function startNode(options) {
     }
 
     if (method === 'POST' && pathname === '/api/tx') {
+      if (refuseThrottled(response, 'tx', request.socket?.remoteAddress)) {
+        // Read and discard the body so the connection can be reused.
+        request.resume();
+        return;
+      }
       const transaction = await readJson(request);
       const source = request.socket.remoteAddress ?? 'peer';
       // Accepted only, like blocks: a duplicate or conflicting transaction
@@ -1688,6 +1944,10 @@ export function startNode(options) {
     }
 
     if (method === 'POST' && pathname === '/api/peers') {
+      if (refuseThrottled(response, 'peers', request.socket?.remoteAddress)) {
+        request.resume();
+        return;
+      }
       const body = await readJson(request, 100_000);
       const listed = [
         ...(Array.isArray(body.peers) ? body.peers : []),

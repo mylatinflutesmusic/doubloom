@@ -543,6 +543,12 @@ body without a boolean `enabled` is rejected with 400, and a node with no payout
 address refuses to start mining with 409 instead of accepting a request it
 cannot honour.
 
+Those calls arrive on loopback, which is why they need no ceremony. Sent to a
+node on another machine they need that node's token — `-H "Authorization:
+Bearer <token>"`, set with the `--api-token-file` or `DOUBLOOM_API_TOKEN`
+described below — and a request without it is refused with 403 rather than
+quietly doing nothing.
+
 Pausing stops only this node's miner: peers, transaction and block relay, sync
 and backups keep running, and nothing about the chain changes. The state is held
 in memory, so a restart returns to whatever `--mine` says on the command line.
@@ -596,11 +602,40 @@ $ doubloom mining status --url http://10.0.0.5:18338 --json
 Two things have to be true for that to answer. First, the remote node must be
 listening beyond loopback: `--host 0.0.0.0` (or an `--announce`d interface, plus
 whatever port forwarding or firewall rules are needed in front of it). Second,
-the network between the two machines must be trusted, because the node API has
-no authentication at all — anyone who can reach `POST /api/mining` can stop that
-node's miner, and the same address exposes transaction submission, peer
-registration and backup download. Keep it on a private network or behind a
-proxy that adds auth; do not port-forward it to the internet. Passing both
+the remote node must accept the call. Its control endpoints — `POST
+/api/mining`, the backup routes and the archive downloads — answer on loopback
+only unless the node was started with a token, and then only to a request that
+carries it. The downloads are the exception even then: an archive holds the
+whole chain and the encrypted wallet, so taking one off the machine also needs
+`--allow-remote-downloads`, which is a decision the operator makes on purpose
+rather than something a token grants by accident.
+
+```bash
+# on the node: one token, in a file only that account can read
+node -e "console.log(require('crypto').randomBytes(32).toString('hex'))" > ~/.doubloom-token
+chmod 600 ~/.doubloom-token
+node src/cli.js node --host 0.0.0.0 --api-token-file ~/.doubloom-token
+
+# from the other machine
+curl -s -X POST http://10.0.0.5:8338/api/mining \
+  -H "Authorization: Bearer $(cat ~/.doubloom-token)" \
+  -H 'content-type: application/json' -d '{"enabled": false}'
+```
+
+`DOUBLOOM_API_TOKEN` sets the same token without a file, and `doubloom mining
+--url` sends whichever of the two is configured, so pausing a node on another
+machine is still one command. Anything else asking for those endpoints gets a
+403 saying why. The peer protocol stays open, because that is what peers must
+reach: `/api/info`, `/api/chain`, `/api/blocks`, `/api/tx`, `/api/block`,
+`/api/peers` and `/api/reachability` still answer anyone. The two that make the
+node work rather than just read it are rate limited per address — a transaction
+costs a validation and a chain write, and an announced peer is dialled later —
+at 60 transactions and 30 peer announcements a minute, refused with 429 and a
+`retry-after` beyond that. Loopback is exempt, so the CLI and the explorer are
+never throttled. What remains exposed by design is the read-only chain view,
+transaction submission and peer registration, so a node on the internet still
+wants a reverse proxy or firewall in front of it; do not port-forward it
+unguarded. Passing both
 `--url` and `--port` is rejected rather than picking one, and a path, query
 string, credentials or non-http scheme in `--url` is refused before any request
 is made.

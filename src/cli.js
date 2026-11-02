@@ -83,6 +83,13 @@ ${BOLD}Options${RESET}
   --url <url>                Node API origin for "mining" instead of --port
                              (default http://127.0.0.1:<port>)
   --host <host>              Node bind address (default 127.0.0.1)
+  --api-token-file <path>    File holding the token that lets another machine
+                             pause mining and run backups; without one they
+                             answer on loopback only. DOUBLOOM_API_TOKEN works
+                             too
+  --allow-remote-downloads   Let a token holder on another machine download
+                             backup archives; without it they are copied on the
+                             node itself only
   --announce <host[:port]>   Address peers should use to reach this node
   --announce-interface <name>
                              Take the announced address from this network
@@ -137,6 +144,35 @@ ${BOLD}Examples${RESET}
   doubloom backup node-backup.json      (writes node-backup.json.gz)
   doubloom --network devnet init
 `);
+}
+
+/**
+ * The token that lets another machine use this node's control endpoints: the
+ * file named by --api-token-file, or DOUBLOOM_API_TOKEN. The file wins, so a
+ * service definition can keep the secret out of its environment.
+ */
+function readApiToken(flags, env) {
+  if (flags['api-token-file'] !== undefined) {
+    if (flags['api-token-file'] === true) {
+      throw new Error(
+        '--api-token-file requires a path to a file holding the token',
+      );
+    }
+    const file = path.resolve(String(flags['api-token-file']));
+    let text;
+    try {
+      text = fs.readFileSync(file, 'utf8');
+    } catch (error) {
+      throw new Error('cannot read --api-token-file ' + file + ': ' + error.message);
+    }
+    const token = text.trim();
+    if (token === '') {
+      throw new Error('--api-token-file ' + file + ' is empty');
+    }
+    return token;
+  }
+  const fromEnv = (env.DOUBLOOM_API_TOKEN ?? '').trim();
+  return fromEnv === '' ? null : fromEnv;
 }
 
 function parseArgs(argv) {
@@ -1552,11 +1588,19 @@ async function main() {
       // Loopback by default, like the explorer's own calls, or an explicit
       // origin for a node this machine did not start.
       const nodeUrl = miningNodeUrl(ctx, flags);
-      const call = async (path, options) => {
+      // A node started with a token expects it on the control calls; status is
+      // public, but sending it either way keeps one path for both.
+      const token = readApiToken(flags, process.env);
+      const call = async (path, options = {}) => {
+        const headers = { ...(options.headers ?? {}) };
+        if (token) {
+          headers.authorization = 'Bearer ' + token;
+        }
         let response;
         try {
           response = await fetch(`${nodeUrl}${path}`, {
             ...options,
+            headers,
             signal: AbortSignal.timeout(5000),
           });
         } catch {
@@ -2057,6 +2101,15 @@ passphrase. Restore it with: doubloom wallet restore <file>${RESET}\n`,
         );
       }
 
+      // Read before the node starts, so a missing or empty file fails here
+      // rather than silently leaving the controls loopback-only.
+      const apiToken = readApiToken(flags, process.env);
+      if (flags['allow-remote-downloads'] && !apiToken) {
+        throw new Error(
+          '--allow-remote-downloads needs a token (--api-token-file or DOUBLOOM_API_TOKEN); without one archives stay on this machine',
+        );
+      }
+
       let seeds = [...(ctx.params.dnsSeeds ?? [])];
       if (flags.seed !== undefined) {
         if (flags.seed === true) {
@@ -2235,6 +2288,8 @@ passphrase. Restore it with: doubloom wallet restore <file>${RESET}\n`,
         chainFile: ctx.chainFile,
         walletFile: ctx.walletFile,
         host: String(flags.host ?? '127.0.0.1'),
+        apiToken,
+        allowRemoteDownloads: Boolean(flags['allow-remote-downloads']),
         port: Number(flags.port ?? ctx.params.defaultPort),
         announce:
           flags.announce === undefined ? undefined : String(flags.announce),

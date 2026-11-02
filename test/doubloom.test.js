@@ -126,6 +126,18 @@ function stoppableNode(passphrase) {
   return { dir, chainFile, walletFile, chain, wallet };
 }
 
+/** A non-loopback IPv4 address of this machine, or null when it has none. */
+function externalIPv4() {
+  for (const addresses of Object.values(os.networkInterfaces())) {
+    for (const entry of addresses ?? []) {
+      if (entry.family === 'IPv4' && !entry.internal) {
+        return entry.address;
+      }
+    }
+  }
+  return null;
+}
+
 function fundedChain(blockCount = 101) {
   const chain = Chain.create(devnet);
   const wallet = new Wallet('unused.json', devnet);
@@ -9140,7 +9152,371 @@ test('the mining command pauses and resumes a running node', async () => {
   }
 });
 
+test('control endpoints answer on loopback, or with the token the node was given', async () => {
+  const { controlRouteAllowed } = await import('../src/node.js');
+  const remote = {
+    method: 'POST',
+    pathname: '/api/mining',
+    remoteAddress: '203.0.113.7',
+    authorization: undefined,
+  };
+
+  // What a peer needs is never a control route, so sync is unaffected.
+  for (const [method, pathname] of [
+    ['GET', '/api/info'],
+    ['GET', '/api/chain'],
+    ['GET', '/api/blocks'],
+    ['GET', '/api/mempool'],
+    ['GET', '/api/mining'],
+    ['POST', '/api/tx'],
+    ['POST', '/api/block'],
+    ['POST', '/api/peers'],
+    ['POST', '/api/reachability'],
+  ]) {
+    assert.equal(
+      controlRouteAllowed({ ...remote, method, pathname }),
+      true,
+      `${method} ${pathname} stays open to peers`,
+    );
+  }
+
+  // Everything that stops the miner, writes a backup or moves an archive is not.
+  for (const [method, pathname] of [
+    ['POST', '/api/mining'],
+    ['POST', '/api/backup'],
+    ['DELETE', '/api/backup/jobs/6d1f'],
+    ['GET', '/api/backup/archives/doubloom-devnet-backup.json.gz'],
+    ['GET', '/api/backup/download'],
+  ]) {
+    assert.equal(
+      controlRouteAllowed({ ...remote, method, pathname }),
+      false,
+      `${method} ${pathname} needs the operator`,
+    );
+  }
+
+  // Loopback is the operator: the CLI and the explorer both call from here.
+  for (const remoteAddress of ['127.0.0.1', '::1', '::ffff:127.0.0.1']) {
+    assert.equal(controlRouteAllowed({ ...remote, remoteAddress }), true);
+  }
+
+  // A token holder may steer the node, but a backup copy is a separate
+  // permission: the archives carry the wallet, so they stay put unless the
+  // operator opted into remote downloads.
+  const download = {
+    method: 'GET',
+    pathname: '/api/backup/download',
+    remoteAddress: '203.0.113.7',
+    authorization: 'Bearer s3cret',
+  };
+  assert.equal(controlRouteAllowed(download, 's3cret'), false);
+  assert.equal(
+    controlRouteAllowed(download, 's3cret', { allowRemoteDownloads: true }),
+    true,
+  );
+  assert.equal(
+    controlRouteAllowed(
+      {
+        ...download,
+        pathname: '/api/backup/archives/doubloom-devnet-backup.json.gz',
+      },
+      's3cret',
+    ),
+    false,
+  );
+  assert.equal(
+    controlRouteAllowed(
+      { ...download, method: 'POST', pathname: '/api/mining' },
+      's3cret',
+      { allowRemoteDownloads: true },
+    ),
+    true,
+    'the opt-in widens downloads only',
+  );
+  assert.equal(
+    controlRouteAllowed(
+      { ...download, remoteAddress: '127.0.0.1' },
+      null,
+      { allowRemoteDownloads: false },
+    ),
+    true,
+  );
+
+  // Anywhere else needs the token, and only the bearer scheme carries it.
+  assert.equal(controlRouteAllowed(remote, 's3cret'), false, 'nothing presented');
+  assert.equal(
+    controlRouteAllowed({ ...remote, authorization: 'Bearer s3cret' }, 's3cret'),
+    true,
+  );
+  assert.equal(
+    controlRouteAllowed({ ...remote, authorization: 'bearer s3cret' }, 's3cret'),
+    true,
+    'the scheme is case-insensitive',
+  );
+  assert.equal(
+    controlRouteAllowed({ ...remote, authorization: 'Bearer wrong' }, 's3cret'),
+    false,
+  );
+  assert.equal(
+    controlRouteAllowed({ ...remote, authorization: 'Bearer s3cret' }, null),
+    false,
+    'a token the node was not started with is not a credential',
+  );
+  assert.equal(
+    controlRouteAllowed({ ...remote, authorization: 'Basic czNjcmV0' }, 's3cret'),
+    false,
+  );
+});
+
+test('a node beyond loopback serves peers but refuses controls without its token', async (t) => {
+  const { startNode } = await import('../src/node.js');
+  const address = externalIPv4();
+  if (!address) {
+    t.skip('this machine has no non-loopback IPv4 address to dial');
+    return;
+  }
+
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'doubloom-control-'));
+  const chainFile = path.join(dir, 'data', devnet.name, 'chain.json');
+  const walletFile = path.join(dir, 'data', devnet.name, 'wallet.json');
+  const chain = Chain.create(devnet);
+  const wallet = Wallet.create(walletFile, devnet);
+  saveChain(chain, chainFile);
+
+  const warnings = [];
+  const originalWarn = console.warn;
+  console.warn = (...args) => warnings.push(args.join(' '));
+
+  let node = null;
+  try {
+    node = startNode({
+      chain,
+      params: devnet,
+      chainFile,
+      walletFile,
+      wallet,
+      host: '0.0.0.0',
+      port: 0,
+      apiToken: 's3cret',
+      mine: false,
+      minerAddress: wallet.defaultKey().address,
+      peers: [],
+      seeds: [],
+      logLevel: 'quiet',
+    });
+    const deadline = Date.now() + 3000;
+    while (!node.server.address() && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    const base = `http://${address}:${node.server.address().port}`;
+    const pause = {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ enabled: false }),
+    };
+
+    try {
+      await fetch(`${base}/api/info`);
+    } catch {
+      t.skip(`this machine cannot dial its own address ${address}`);
+      return;
+    }
+
+    assert.equal((await fetch(`${base}/api/info`)).status, 200, 'peers can read the node');
+    assert.equal((await fetch(`${base}/api/mining`)).status, 200, 'status is not a control');
+
+    const refused = await fetch(`${base}/api/mining`, pause);
+    assert.equal(refused.status, 403);
+    assert.match((await refused.json()).error, /loopback/);
+
+    const allowed = await fetch(`${base}/api/mining`, {
+      ...pause,
+      headers: { ...pause.headers, authorization: 'Bearer s3cret' },
+    });
+    assert.equal(allowed.status, 200);
+
+    assert.equal((await fetch(`${base}/api/backup/download`)).status, 403);
+    assert.ok(
+      warnings.some((line) => /refused POST \/api\/mining/.test(line)),
+      'a refused control request is logged',
+    );
+
+    // The token steers the node but does not carry the backup off it.
+    const archive = await fetch(`${base}/api/backup/download`, {
+      headers: { authorization: 'Bearer s3cret' },
+    });
+    assert.equal(archive.status, 403);
+    assert.match((await archive.json()).error, /allow-remote-downloads/);
+    assert.equal(
+      (
+        await fetch(`${base}/api/backup/archives/doubloom-devnet-1.json.gz`, {
+          headers: { authorization: 'Bearer s3cret' },
+        })
+      ).status,
+      403,
+    );
+  } finally {
+    if (node) {
+      await node.close();
+    }
+    console.warn = originalWarn;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a token holder reaches the archives only when the node allows remote downloads', async (t) => {
+  const { startNode } = await import('../src/node.js');
+  const address = externalIPv4();
+  if (!address) {
+    t.skip('this machine has no non-loopback IPv4 address to dial');
+    return;
+  }
+
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'doubloom-downloads-'));
+  const chainFile = path.join(dir, 'data', devnet.name, 'chain.json');
+  const chain = Chain.create(devnet);
+  saveChain(chain, chainFile);
+
+  let node = null;
+  try {
+    node = startNode({
+      chain,
+      params: devnet,
+      chainFile,
+      host: '0.0.0.0',
+      port: 0,
+      apiToken: 's3cret',
+      allowRemoteDownloads: true,
+      mine: false,
+      peers: [],
+      seeds: [],
+      logLevel: 'quiet',
+    });
+    const deadline = Date.now() + 3000;
+    while (!node.server.address() && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    const base = `http://${address}:${node.server.address().port}`;
+
+    let answered;
+    try {
+      answered = await fetch(`${base}/api/backup/download`, {
+        headers: { authorization: 'Bearer s3cret' },
+      });
+    } catch {
+      t.skip(`this machine cannot dial its own address ${address}`);
+      return;
+    }
+
+    // Past the guard and into the handler: no schedule is running, so the
+    // download is refused for that reason rather than for the address it came
+    // from. That is what the opt-in buys.
+    assert.equal(answered.status, 409);
+    assert.match((await answered.json()).error, /not enabled/);
+
+    // The token is still what lets it in at all.
+    assert.equal((await fetch(`${base}/api/backup/download`)).status, 403);
+  } finally {
+    if (node) {
+      await node.close();
+    }
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a public node throttles transactions and peer announcements, but not loopback', async (t) => {
+  const { startNode } = await import('../src/node.js');
+  const address = externalIPv4();
+  if (!address) {
+    t.skip('this machine has no non-loopback IPv4 address to dial');
+    return;
+  }
+
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'doubloom-throttle-'));
+  const chainFile = path.join(dir, 'data', devnet.name, 'chain.json');
+  const chain = Chain.create(devnet);
+  saveChain(chain, chainFile);
+
+  const warnings = [];
+  const originalWarn = console.warn;
+  console.warn = (...args) => warnings.push(args.join(' '));
+
+  let node = null;
+  try {
+    node = startNode({
+      chain,
+      params: devnet,
+      chainFile,
+      host: '0.0.0.0',
+      port: 0,
+      mine: false,
+      peers: [],
+      seeds: [],
+      logLevel: 'quiet',
+    });
+    const deadline = Date.now() + 3000;
+    while (!node.server.address() && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    const port = node.server.address().port;
+    const base = `http://${address}:${port}`;
+    const post = (route, body) =>
+      fetch(base + route, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+
+    let first;
+    try {
+      first = await post('/api/tx', {});
+    } catch {
+      t.skip(`this machine cannot dial its own address ${address}`);
+      return;
+    }
+    // An empty object is rejected as a transaction, which is what makes this
+    // cheap to send: the limiter counts attempts, not successes.
+    assert.equal(first.status, 400);
+    for (let attempt = 1; attempt < 60; attempt += 1) {
+      assert.equal((await post('/api/tx', {})).status, 400);
+    }
+    const throttled = await post('/api/tx', {});
+    assert.equal(throttled.status, 429);
+    assert.ok(
+      Number(throttled.headers.get('retry-after')) >= 1,
+      'a throttled caller is told when to come back',
+    );
+    assert.match((await throttled.json()).error, /too many tx requests/);
+
+    // Peer announcements have their own allowance.
+    for (let attempt = 0; attempt < 30; attempt += 1) {
+      assert.equal((await post('/api/peers', { peer: 'not a url' })).status, 200);
+    }
+    assert.equal((await post('/api/peers', { peer: 'not a url' })).status, 429);
+
+    // This machine is the operator: the CLI and the explorer are never
+    // throttled, however loud the same machine is over its LAN address.
+    const local = await fetch(`http://127.0.0.1:${port}/api/tx`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: '{}',
+    });
+    assert.equal(local.status, 400);
+    assert.ok(
+      warnings.some((line) => /throttled tx requests from/.test(line)),
+      'throttling is logged',
+    );
+  } finally {
+    if (node) {
+      await node.close();
+    }
+    console.warn = originalWarn;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('coinbase transactions are recognized', () => {
+
   const coinbase = createCoinbase({
     height: 5,
     value: 50n * COIN,
