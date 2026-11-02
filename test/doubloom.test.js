@@ -8194,13 +8194,18 @@ test('backup list shows each archive with its size and retention tier', async ()
   const backupDir = path.join(dir, 'backups');
   fs.mkdirSync(backupDir, { recursive: true });
 
-  // Four archives at four distances, so each is kept by a different tier.
-  const now = Date.now();
+  // Four archives at fixed instants, so each is kept by a different tier and the
+  // answer cannot drift with the day the suite happens to run. Distances from
+  // `Date.now()` would: 26 hours back leaves the current ISO week whenever the
+  // run starts on a Monday before 02:00 UTC, which hands the second weekly slot
+  // to the 26-hour archive and leaves the 8-day one prunable. Here A and B share
+  // one ISO week (B is the older of the two, so only daily keeps it), C is the
+  // previous week's keeper, and D is older than both kept weeks.
   const dates = [
-    new Date(now - 60_000),
-    new Date(now - 26 * 3_600_000),
-    new Date(now - 8 * 86_400_000),
-    new Date(now - 30 * 86_400_000),
+    new Date('2026-03-10T12:00:00Z'), // A: Tuesday, ISO week 11
+    new Date('2026-03-09T12:00:00Z'), // B: Monday, ISO week 11
+    new Date('2026-03-06T12:00:00Z'), // C: Friday, ISO week 10
+    new Date('2026-02-20T12:00:00Z'), // D: Friday, ISO week 8
   ];
   const names = dates.map((date) => backupFileName(devnet.name, date));
   [1500, 2048, 512, 3_000_000].forEach((bytes, index) => {
