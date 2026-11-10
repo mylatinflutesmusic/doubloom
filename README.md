@@ -1476,6 +1476,44 @@ file: if the passphrase is lost, the keys cannot be decrypted.
 UTXO set and transaction index are rebuilt and re-validated from the blocks on
 load, so a corrupted chain fails loudly rather than being trusted.
 
+## Running unattended on Windows
+
+Windows will not start the node after a reboot by itself. A scheduled task named
+`Doubloom Node` runs at logon and starts a small supervisor,
+`.tmp-ops/supervisor.ps1`, which launches the node hidden and stays as its
+parent. It keeps three promises:
+
+- **One node only.** The task refuses concurrent runs, the supervisor holds a
+  named mutex, and it probes port 8338 before launching: a node started by hand
+  is left alone, then taken over once it exits.
+- **It comes back.** A node that exits is restarted after 5s, then 10s, doubling
+  to a five-minute cap. The delay resets as soon as a node has stayed up for five
+  minutes, so a crash loop backs off instead of spinning.
+- **It stops as one.** Ending the task stops the node with it.
+
+What it has done is written to `.tmp-ops/supervisor-status.json` — the restart
+count, the last restart, the last exit code and whether backups are on — and its
+path is handed to the node as `DOUBLOOM_SUPERVISOR_STATUS`. `GET /api/supervisor`
+serves that file and the explorer's Process supervision panel shows it, turning
+amber at one restart and red at three. A node started by hand, with no supervisor
+behind it, answers `{"available": false}` and the panel says so.
+
+### Enabling automatic backups
+
+`--backup-dir` needs the wallet passphrase, and a hidden start has no terminal to
+ask for it. The supervisor reads `.tmp-ops/passphrase.txt` instead and passes the
+value to the node in `DOUBLOOM_PASSPHRASE` — never on a command line, never in the
+task definition, never in a log:
+
+```bash
+notepad C:\Users\User\Documents\crypto\.tmp-ops\passphrase.txt
+```
+
+One line, with no trailing blank line. Within fifteen seconds the supervisor
+restarts the node with the hourly schedule and logs the change; deleting the file
+turns backups off the same automatic way. Both `.tmp-ops/` and the logs written
+beside it are ignored by git.
+
 ## Where Doubloom differs from Bitcoin
 
 Doubloom follows Bitcoin's monetary and consensus design, but it is a compact
