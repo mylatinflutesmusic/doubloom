@@ -857,6 +857,24 @@
         <div class="backup-note" id="backup-note" hidden></div>
       </section>
 
+      <section class="panel" aria-label="Process supervision">
+        <div class="panel-head">
+          <h3>Process supervision</h3>
+          <span class="health" id="supervisor-state" aria-live="polite">
+            <span class="health-dot" aria-hidden="true"></span>
+            <span id="supervisor-state-label">checking</span>
+          </span>
+        </div>
+        <dl class="facts">
+          <div><dt>Restarts</dt><dd id="supervisor-restarts">—</dd></div>
+          <div><dt>Last restart</dt><dd id="supervisor-last-restart">—</dd></div>
+          <div><dt>Node started</dt><dd id="supervisor-node-started">—</dd></div>
+          <div><dt>Last exit</dt><dd id="supervisor-last-exit">—</dd></div>
+          <div><dt>Supervisor</dt><dd class="mono" id="supervisor-identity">—</dd></div>
+        </dl>
+        <div class="backup-note" id="supervisor-note" hidden></div>
+      </section>
+
       <section class="grid2">
         <div class="panel">
           <div class="panel-head"><h3>Mempool</h3><span id="mempool-note"></span></div>
@@ -1662,13 +1680,89 @@
           .join("") || `<tr><td colspan="4" class="empty">No peer traffic since this node started.</td></tr>`;
       }
 
+      function renderSupervisor(status) {
+        const state = $("supervisor-state");
+        const label = $("supervisor-state-label");
+        const note = $("supervisor-note");
+
+        if (!status || !status.available) {
+          state.className = "health off";
+          label.textContent = "not supervised";
+          state.title = "";
+          for (const id of [
+            "supervisor-restarts",
+            "supervisor-last-restart",
+            "supervisor-node-started",
+            "supervisor-last-exit",
+            "supervisor-identity",
+          ]) {
+            $(id).textContent = "—";
+            $(id).removeAttribute("title");
+          }
+          note.textContent =
+            "No supervisor is reporting to this node: it was started directly, so a crash leaves it down.";
+          note.hidden = false;
+          return;
+        }
+
+        note.hidden = true;
+        const restarts = Number.isFinite(status.restarts) ? status.restarts : null;
+        // A node that keeps coming back is the thing worth seeing at a glance,
+        // so the level follows the count rather than just liveness.
+        const level =
+          restarts === null
+            ? "off"
+            : restarts === 0
+              ? "ok"
+              : restarts < 3
+                ? "warn"
+                : "bad";
+        state.className = `health ${level}`;
+        label.textContent =
+          restarts === null
+            ? "supervised"
+            : restarts === 0
+              ? "no restarts"
+              : `${formatNumber(restarts)} restart${restarts === 1 ? "" : "s"}`;
+        state.title = `supervisor pid ${status.supervisorPid ?? "unknown"}`;
+
+        $("supervisor-restarts").textContent =
+          restarts === null ? "—" : formatNumber(restarts);
+        $("supervisor-restarts").title =
+          restarts === 0
+            ? "This supervisor has not had to restart the node"
+            : `${formatNumber(restarts)} restart${restarts === 1 ? "" : "s"} since the supervisor started`;
+
+        const lastRestart = status.lastRestartAt;
+        $("supervisor-last-restart").textContent = lastRestart
+          ? `${ageIso(lastRestart)} · ${utcTime(lastRestart)}`
+          : "never";
+        $("supervisor-last-restart").title = lastRestart ?? "no restart has happened";
+
+        $("supervisor-node-started").textContent = status.nodeStartedAt
+          ? `${ageIso(status.nodeStartedAt)} · ${utcTime(status.nodeStartedAt)}`
+          : "—";
+        $("supervisor-node-started").title = status.nodeStartedAt ?? "";
+
+        $("supervisor-last-exit").textContent = status.lastExitAt
+          ? `${ageIso(status.lastExitAt)} · code ${status.lastExitCode ?? "unknown"}`
+          : "—";
+        $("supervisor-last-exit").title = status.lastExitAt
+          ? `the node exited with code ${status.lastExitCode ?? "unknown"}`
+          : "the node has not exited since the supervisor started";
+
+        $("supervisor-identity").textContent = `pid ${status.supervisorPid ?? "?"} · backups ${status.backupsOn ? "on" : "off"}`;
+        $("supervisor-identity").title = "the process holding the node up, and whether it starts it with automatic backups";
+      }
+
       async function refresh() {
         try {
-          const [info, blocks, mempool, backup] = await Promise.all([
+          const [info, blocks, mempool, backup, supervision] = await Promise.all([
             get("/api/info"),
             get("/api/blocks?limit=12"),
             get("/api/mempool"),
             get("/api/backup").catch(() => null),
+            get("/api/supervisor").catch(() => null),
           ]);
 
           $("network").textContent = info.network;
@@ -1716,6 +1810,7 @@
           renderPeerTraffic(info.peerTraffic);
           $("network-note").textContent = `${info.network} · best ${String(info.bestBlockHash).slice(0, 16)}…`;
           renderBackup(info, backup);
+          renderSupervisor(supervision);
           renderReorg(info);
           renderSwitches(info.reorgHistory);
 

@@ -3157,6 +3157,74 @@ test('the explorer links every retained backup archive for download', () => {
   assert.match(explorer, /\$\{exactSize\}/);
 });
 
+test('the node reports supervisor restarts from its status file', async () => {
+  const { startNode } = await import('../src/node.js');
+  const { dir, chainFile, walletFile, chain, wallet } = temporaryNode();
+  const statusFile = path.join(dir, 'supervisor-status.json');
+  const previous = process.env.DOUBLOOM_SUPERVISOR_STATUS;
+  const originalLog = console.log;
+  console.log = () => {};
+  let node = null;
+
+  const listening = async (instance) => {
+    const deadline = Date.now() + 3000;
+    while (!instance.server.address() && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    return `http://127.0.0.1:${instance.server.address().port}`;
+  };
+
+  try {
+    node = startNode({ chain, params: devnet, chainFile, walletFile, wallet, port: 0 });
+    const url = await listening(node);
+
+    // A node started by hand has no supervisor, and says so rather than
+    // inventing a count.
+    delete process.env.DOUBLOOM_SUPERVISOR_STATUS;
+    assert.deepEqual(await (await fetch(`${url}/api/supervisor`)).json(), {
+      available: false,
+    });
+
+    // A missing file and a malformed one are the same answer, not an error.
+    process.env.DOUBLOOM_SUPERVISOR_STATUS = path.join(dir, 'absent.json');
+    assert.deepEqual(await (await fetch(`${url}/api/supervisor`)).json(), {
+      available: false,
+    });
+    fs.writeFileSync(statusFile, 'not json', 'utf8');
+    process.env.DOUBLOOM_SUPERVISOR_STATUS = statusFile;
+    assert.deepEqual(await (await fetch(`${url}/api/supervisor`)).json(), {
+      available: false,
+    });
+
+    // The supervisor's own fields are passed through untouched.
+    fs.writeFileSync(
+      statusFile,
+      JSON.stringify({
+        supervisorPid: 4242,
+        nodePid: 4343,
+        restarts: 2,
+        lastRestartAt: '2026-01-02T03:04:05.000Z',
+        lastExitAt: '2026-01-02T03:04:00.000Z',
+        lastExitCode: 'unknown',
+        backupsOn: true,
+      }),
+      'utf8',
+    );
+    const status = await (await fetch(`${url}/api/supervisor`)).json();
+    assert.equal(status.available, true);
+    assert.equal(status.restarts, 2);
+    assert.equal(status.supervisorPid, 4242);
+    assert.equal(status.lastRestartAt, '2026-01-02T03:04:05.000Z');
+    assert.equal(status.backupsOn, true);
+  } finally {
+    if (previous === undefined) delete process.env.DOUBLOOM_SUPERVISOR_STATUS;
+    else process.env.DOUBLOOM_SUPERVISOR_STATUS = previous;
+    console.log = originalLog;
+    if (node) await node.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('the node lists every retained archive and serves any of them', async () => {
   const { startNode } = await import('../src/node.js');
   const passphrase = 'archive list passphrase';

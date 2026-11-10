@@ -155,6 +155,30 @@ export function isDownloadRoute(method, pathname) {
   return matchesRoute(DOWNLOAD_ROUTES, method, pathname);
 }
 
+/**
+ * State written by whatever process keeps this node alive, such as the logon
+ * supervisor on Windows. It is kept in a file outside the node so a crash and
+ * restart cannot erase the count; the node only reads it, and only when
+ * DOUBLOOM_SUPERVISOR_STATUS names the file. Anything unreadable is reported as
+ * "not supervised" rather than as an error, because a node started by hand has
+ * no supervisor at all.
+ */
+function supervisorStatus() {
+  const file = process.env.DOUBLOOM_SUPERVISOR_STATUS;
+  if (!file) {
+    return { available: false };
+  }
+  try {
+    const status = JSON.parse(fs.readFileSync(file, 'utf8'));
+    if (!status || typeof status !== 'object' || Array.isArray(status)) {
+      return { available: false };
+    }
+    return { available: true, ...status };
+  } catch {
+    return { available: false };
+  }
+}
+
 /** Whether a socket address is this machine, including the IPv4-mapped form. */
 export function isLoopbackAddress(address) {
   const host = normalizeHost(address);
@@ -1438,6 +1462,11 @@ export function startNode(options) {
         address: minerAddress,
         height: chain.height,
       });
+      return;
+    }
+
+    if (method === 'GET' && pathname === '/api/supervisor') {
+      sendJson(response, 200, supervisorStatus());
       return;
     }
 
